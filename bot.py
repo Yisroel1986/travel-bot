@@ -1,7 +1,9 @@
-import os
+import o
+import threadings
 import logging
 import openai
 
+from flask import Flask, request, jsonify
 from dotenv import load_dotenv
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
 
@@ -27,9 +29,11 @@ print("DEBUG BOT_TOKEN =", BOT_TOKEN)
 
 # Обработчик команды /start
 def start(update, context):
-    update.message.reply_text("Привет! Я бот на python-telegram-bot 13.15.\nЧем могу помочь?")
+    """Обработчик команды /start."""
+    update.message.reply_text("Привет! Я бот на python-telegram-bot + ChatGPT.")
 
 def ask_gpt(update, context):
+    """Обработчик простых текстовых сообщений, отправляет запрос в GPT-3.5-turbo."""
     user_text = update.message.text
     try:
         response = openai.ChatCompletion.create(
@@ -47,11 +51,29 @@ def ask_gpt(update, context):
     except Exception as e:
         update.message.reply_text(f"Ошибка при запросе к OpenAI: {e}")
 
-# (Необязательно) Обработчик /help
-def help_command(update, context):
-    update.message.reply_text("Список доступных команд:\n"
-                              "/start - начать\n"
-                              "/help - помощь")
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    """Простая проверка, что сервер работает."""
+    return "Hello, I'm a Telegram polling bot + Flask Web Service for future FB/IG"
+
+def run_telegram_polling():
+    """Запускаем polling для Телеграма в отдельном потоке."""
+    if not BOT_TOKEN:
+        logger.error("TELEGRAM_BOT_TOKEN не задан! Проверь переменные окружения.")
+        return
+
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    # Регистрируем команды и обработчики
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, ask_gpt))
+
+    # Запуск polling
+    updater.start_polling()
+    updater.idle()
 
 def main():
     """Основная точка входа в программу."""
@@ -80,4 +102,10 @@ def main():
     updater.idle()
 
 if __name__ == "__main__":
-    main()
+    # 1) Запуск поллинга Телеграма в отдельном потоке
+    polling_thread = threading.Thread(target=run_telegram_polling, daemon=True)
+    polling_thread.start()
+
+    # 2) Запуск Flask-сервера (Render увидит, что мы слушаем PORT)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
