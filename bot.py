@@ -4,10 +4,19 @@ import sys
 import psutil
 from dotenv import load_dotenv
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    ContextTypes
+)
 import openai
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request
+import asyncio
+import threading
 
 # Включаем логирование
 logging.basicConfig(
@@ -22,6 +31,7 @@ load_dotenv()
 # Считываем токены из .env
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')  # Замените на ваш URL
 
 # Назначаем ключ OpenAI
 openai.api_key = OPENAI_API_KEY
@@ -48,7 +58,7 @@ def is_bot_already_running():
         if process.info['name'] == current_process.name() and \
            process.info['cmdline'] == current_process.cmdline() and \
            process.info['pid'] != current_process.pid:
-            return True
+                return True
     return False
 
 async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
@@ -62,7 +72,7 @@ async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
     Учти, что наш целевой клиент — мама 28-45 лет, ценящая семью, ищет безопасный и 
     комфортный тур в зоопарк Ньїредьгаза для ребенка. 
     Мы используем женский мягкий тон, 
-    делаем акценты на отдыхе для мамы, на детской радости, безопасности. 
+    делаем акценты на отдыхе для мамы, на детской радості, безопасности. 
     Применяй FOMO (ограничения мест), соцдоказательства, 
     якорение цены (другие туры дороже, но мы даём то же, и даже больше). 
     Стадия: {stage}.
@@ -93,6 +103,7 @@ def mention_user(update: Update) -> str:
         return user.first_name if user.first_name else "друже"
     return "друже"
 
+# Определение всех обработчиков
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
     # Советы от экспертов
@@ -363,7 +374,7 @@ async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancels and ends the conversation."""
+    """Отменяет и завершает разговор."""
     user = update.message.from_user
     logger.info("User %s canceled the conversation.", user.first_name)
     await update.message.reply_text(
@@ -376,26 +387,31 @@ app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Бот работает!"
+    return "Бот працює!"
 
 @app.route('/webhook', methods=['POST'])
-async def webhook():
+def webhook():
     if request.method == "POST":
-        update = Update.de_json(request.get_json(force=True), application.bot)
-        await application.process_update(update)
+        data = request.get_json(force=True)
+        update = Update.de_json(data, application.bot)
+        # Передаем обновление боту асинхронно
+        asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
+        logger.info("Webhook received and update passed to bot.")
     return "OK"
 
-async def setup_webhook(url):
-    await application.bot.set_webhook(url + '/webhook')
+async def setup_webhook(url, application):
+    webhook_url = f"{url}/webhook"
+    await application.bot.set_webhook(webhook_url)
+    logger.info(f"Webhook set to: {webhook_url}")
 
-async def main():
+async def run_bot():
     global application
     if is_bot_already_running():
         logger.error("Another instance of the bot is already running. Exiting.")
         sys.exit(1)
 
     # Указываем временную зону
-    tz = timezone(timedelta(hours=2))  # UTC+2 for Kiev
+    tz = timezone(timedelta(hours=2))  # UTC+2 для Киева
 
     # Логируем используемую временную зону
     logger.info(f"Используемая временная зона: {tz}")
@@ -406,6 +422,7 @@ async def main():
     # Устанавливаем часовой пояс в bot_data
     application.bot_data["timezone"] = tz
 
+    # Создаем ConversationHandler и добавляем его в приложение
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -428,18 +445,25 @@ async def main():
     application.add_handler(conv_handler)
 
     # Настраиваем вебхук
-    webhook_url = os.getenv('RENDER_EXTERNAL_URL', 'https://travel-bot-5u6d.onrender.com')
-    await setup_webhook(webhook_url)
+    await setup_webhook(WEBHOOK_URL, application)
 
-    # Запускаем бота
+    # Инициализируем и стартуем приложение
     await application.initialize()
     await application.start()
-    # Не используем polling, так как мы используем вебхуки
-    # await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-if __name__ == '__main__':
-    import asyncio
+    # Бот готов к обработке вебхуков
+    logger.info("Telegram бот запущен і готовий до обробки вебхуків.")
+
+def start_flask():
     port = int(os.environ.get('PORT', 5000))
-    asyncio.run(main())
+    logger.info(f"Запускаємо Flask на порті {port}")
     app.run(host='0.0.0.0', port=port)
 
+if __name__ == '__main__':
+    # Запускаем Telegram бота в отдельном потоке
+    bot_thread = threading.Thread(target=lambda: asyncio.run(run_bot()), daemon=True)
+    bot_thread.start()
+    logger.info("Запуск бота в окремому потоці.")
+
+    # Запускаем Flask сервер в основном потоке
+    start_flask()
