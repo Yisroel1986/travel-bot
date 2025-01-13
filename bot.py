@@ -52,6 +52,9 @@ openai.api_key = OPENAI_API_KEY
     STATE_FINISH
 ) = range(12)
 
+# Глобальная переменная для цикла событий бота
+bot_loop = None
+
 def is_bot_already_running():
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -65,16 +68,16 @@ async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
     """
     Вызывает OpenAI ChatCompletion, передавая «ролям-экспертам» текущий этап,
     текст пользователя и контекст.
-    Возвращает строку советов. 
+    Возвращает строку советов.
     """
     system_prompt = f"""
     Ты — команда экспертов: SalesGuru, ObjectionsPsychologist, MarketingHacker.
     Учти, что наш целевой клиент — мама 28-45 лет, ценящая семью, ищет безопасный и 
     комфортный тур в зоопарк Ньїредьгаза для ребенка. 
     Мы используем женский мягкий тон, 
-    делаем акценты на отдыхе для мамы, на детской радості, безопасности. 
+    делаем акценты на отдыхе для мамы, на детской радости, безопасности. 
     Применяй FOMO (ограничения мест), соцдоказательства, 
-    якорение цены (другие туры дороже, но мы даём то же, и даже больше). 
+    якорение цены (другие туры дороже, но мы даем то же, и даже больше). 
     Стадия: {stage}.
     Сообщение от пользователя: {user_text}.
     Дай 3 коротких совета, по 1-2 предложения, от имени каждой роли.
@@ -395,34 +398,37 @@ def webhook():
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
         # Передаем обновление боту асинхронно
-        asyncio.run_coroutine_threadsafe(application.process_update(update), application.loop)
-        logger.info("Webhook received and update passed to bot.")
+        if bot_loop:
+            asyncio.run_coroutine_threadsafe(application.process_update(update), bot_loop)
+            logger.info("Webhook отримано та передано боту.")
+        else:
+            logger.error("Цикл подій бота не ініціалізовано.")
     return "OK"
 
 async def setup_webhook(url, application):
     webhook_url = f"{url}/webhook"
     await application.bot.set_webhook(webhook_url)
-    logger.info(f"Webhook set to: {webhook_url}")
+    logger.info(f"Webhook встановлено на: {webhook_url}")
 
 async def run_bot():
-    global application
+    global application, bot_loop
     if is_bot_already_running():
-        logger.error("Another instance of the bot is already running. Exiting.")
+        logger.error("Інша інстанція бота вже запущена. Вихід.")
         sys.exit(1)
 
-    # Указываем временную зону
-    tz = timezone(timedelta(hours=2))  # UTC+2 для Киева
+    # Вказуємо часовий пояс
+    tz = timezone(timedelta(hours=2))  # UTC+2 для Києва
 
-    # Логируем используемую временную зону
-    logger.info(f"Используемая временная зона: {tz}")
+    # Логуємо використаний часовий пояс
+    logger.info(f"Використаний часовий пояс: {tz}")
 
-    # Создаём Application
+    # Створюємо Application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Устанавливаем часовой пояс в bot_data
+    # Встановлюємо часовий пояс у bot_data
     application.bot_data["timezone"] = tz
 
-    # Создаем ConversationHandler и добавляем его в приложение
+    # Створюємо ConversationHandler та додаємо його в додаток
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -444,26 +450,29 @@ async def run_bot():
 
     application.add_handler(conv_handler)
 
-    # Настраиваем вебхук
+    # Налаштовуємо webhook
     await setup_webhook(WEBHOOK_URL, application)
 
-    # Инициализируем и стартуем приложение
+    # Ініціалізуємо та запускаємо додаток
     await application.initialize()
     await application.start()
 
-    # Бот готов к обработке вебхуков
-    logger.info("Telegram бот запущен і готовий до обробки вебхуків.")
+    # Отримуємо поточний цикл подій та зберігаємо його в глобальній змінній
+    bot_loop = asyncio.get_running_loop()
+
+    # Бот готовий до обробки вебхуків
+    logger.info("Telegram бот запущено і готовий до обробки вебхуків.")
 
 def start_flask():
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 10000))
     logger.info(f"Запускаємо Flask на порті {port}")
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
-    # Запускаем Telegram бота в отдельном потоке
+    # Запускаємо Telegram бота в окремому потоці
     bot_thread = threading.Thread(target=lambda: asyncio.run(run_bot()), daemon=True)
     bot_thread.start()
     logger.info("Запуск бота в окремому потоці.")
 
-    # Запускаем Flask сервер в основном потоке
+    # Запускаємо Flask сервер в основному потоці
     start_flask()
