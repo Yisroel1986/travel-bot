@@ -7,6 +7,7 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ConversationHandler, ContextTypes
 import openai
 from datetime import datetime, timezone, timedelta
+from flask import Flask, request
 
 # Включаем логирование
 logging.basicConfig(
@@ -370,6 +371,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
+# Создаем Flask приложение
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Бот работает!"
+
 async def main():
     if is_bot_already_running():
         logger.error("Another instance of the bot is already running. Exiting.")
@@ -415,5 +423,7 @@ async def main():
 
 if __name__ == '__main__':
     import asyncio
+    port = int(os.environ.get('PORT', 5000))
     asyncio.run(main())
+    app.run(host='0.0.0.0', port=port)
 
