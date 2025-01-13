@@ -378,7 +378,18 @@ app = Flask(__name__)
 def index():
     return "Бот работает!"
 
+@app.route('/webhook', methods=['POST'])
+async def webhook():
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), application.bot)
+        await application.process_update(update)
+    return "OK"
+
+async def setup_webhook(url):
+    await application.bot.set_webhook(url + '/webhook')
+
 async def main():
+    global application
     if is_bot_already_running():
         logger.error("Another instance of the bot is already running. Exiting.")
         sys.exit(1)
@@ -416,10 +427,15 @@ async def main():
 
     application.add_handler(conv_handler)
 
+    # Настраиваем вебхук
+    webhook_url = os.getenv('RENDER_EXTERNAL_URL', 'https://travel-bot-5u6d.onrender.com')
+    await setup_webhook(webhook_url)
+
     # Запускаем бота
     await application.initialize()
     await application.start()
-    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Не используем polling, так как мы используем вебхуки
+    # await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
     import asyncio
