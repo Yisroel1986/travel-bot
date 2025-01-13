@@ -370,7 +370,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
-def main():
+async def main():
     if is_bot_already_running():
         logger.error("Another instance of the bot is already running. Exiting.")
         sys.exit(1)
@@ -409,8 +409,11 @@ def main():
     application.add_handler(conv_handler)
 
     # Запускаем бота
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.initialize()
+    await application.start()
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    asyncio.run(main())
 
