@@ -92,8 +92,7 @@ async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
             model="gpt-3.5-turbo",
             messages=messages,
             max_tokens=1000,
-            temperature=0.7,
-            language="uk"
+            temperature=0.7
         )
         advice_text = response["choices"][0]["message"]["content"]
         return advice_text.strip()
