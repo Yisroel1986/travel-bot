@@ -17,7 +17,7 @@ from datetime import timezone, timedelta
 from flask import Flask, request
 import asyncio
 import threading
-from transformers import pipeline
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
 # Включаем логирование
 logging.basicConfig(
@@ -55,11 +55,6 @@ openai.api_key = OPENAI_API_KEY
 # Глобальная переменная для цикла событий бота
 bot_loop = None
 
-# Инициализируйте zero-shot классификатор
-logger.info("Загрузка модели для анализа тональности...")
-sentiment_analyzer = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
-logger.info("Модель для анализа тональности загружена.")
-
 def is_bot_already_running():
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -69,13 +64,21 @@ def is_bot_already_running():
                 return True
     return False
 
+# Инициализация VADER
+logger.info("Инициализация VADER Sentiment Analyzer...")
+sentiment_analyzer = SentimentIntensityAnalyzer()
+logger.info("VADER Sentiment Analyzer инициализирован.")
+
 async def analyze_sentiment(text: str) -> str:
-    candidate_labels = ["позитивний", "негативний", "нейтральний"]
     try:
-        result = sentiment_analyzer(text, candidate_labels)
-        # Получаем наиболее вероятную категорию
-        top_label = result['labels'][0]
-        return top_label
+        scores = sentiment_analyzer.polarity_scores(text)
+        compound = scores['compound']
+        if compound >= 0.05:
+            return "позитивний"
+        elif compound <= -0.05:
+            return "негативний"
+        else:
+            return "нейтральний"
     except Exception as e:
         logger.error(f"Error in sentiment analysis: {e}")
         return "нейтральний"
