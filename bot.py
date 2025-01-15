@@ -3,7 +3,7 @@ import logging
 import sys
 import psutil
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -39,18 +39,17 @@ openai.api_key = OPENAI_API_KEY
 # Состояния
 (
     STATE_INTRO,
-    STATE_NEEDS,
-    STATE_PSYCHO,
+    STATE_TOUR_TYPE,
+    STATE_NEEDS_CITY,
+    STATE_NEEDS_CHILDREN,
+    STATE_CONTACT_INFO,
     STATE_PRESENTATION,
-    STATE_OBJECTIONS,
-    STATE_QUOTE,
-    STATE_FAQ,
+    STATE_ADDITIONAL_QUESTIONS,
     STATE_FEEDBACK,
     STATE_PAYMENT,
-    STATE_RESERVATION,
-    STATE_TRANSFER,
+    STATE_CLOSE_DEAL,
     STATE_FINISH
-) = range(12)
+) = range(11)
 
 # Глобальная переменная для цикла событий бота
 bot_loop = None
@@ -64,11 +63,10 @@ def is_bot_already_running():
                 return True
     return False
 
-async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
+async def invoke_gpt(stage: str, user_text: str, context_data: dict):
     """
-    Вызывает OpenAI ChatCompletion, передавая «ролям-экспертам» текущий этап,
-    текст пользователя и контекст.
-    Возвращает строку советов.
+    Вызывает OpenAI ChatCompletion с учётом текущего этапа диалога.
+    Возвращает ответ от модели.
     """
     system_prompt = f"""
     Ти — команда експертів: SalesGuru, ObjectionsPsychologist, MarketingHacker.
@@ -80,12 +78,11 @@ async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
     якір цін (інші тури дорожчі, але ми даємо те саме, і навіть більше). 
     Стадія: {stage}.
     Повідомлення від користувача: {user_text}.
-    Дай 3 короткі поради, по 1-2 речення, від імені кожної ролі.
     Відповідь повинна починатися з "Відповідь менеджера:" і бути написана українською мовою.
     """
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "Будь ласка, надай три поради для бота (1 від кожного експерта)."}
+        {"role": "user", "content": "Будь ласка, відповідай відповідно до стадії діалогу."}
     ]
     try:
         response = await openai.ChatCompletion.acreate(
@@ -98,7 +95,7 @@ async def invoke_gpt_experts(stage: str, user_text: str, context_data: dict):
         return advice_text.strip()
     except Exception as e:
         logger.error(f"Помилка при зверненні до OpenAI: {e}")
-        return "Не вдалося отримати поради від віртуальних експертів."
+        return "Відповідь менеджера: На жаль, наразі я не можу відповісти на ваше запитання. Спробуйте пізніше."
 
 def mention_user(update: Update) -> str:
     """Утиліта для красивого звернення по імені."""
@@ -111,7 +108,7 @@ def mention_user(update: Update) -> str:
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
     # Советы от экспертов
-    adv = await invoke_gpt_experts("intro", "/start", context.user_data)
+    adv = await invoke_gpt("intro", "/start", context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
 
     text = (
@@ -126,31 +123,84 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
     # GPT
-    adv = await invoke_gpt_experts("intro", user_text, context.user_data)
+    adv = await invoke_gpt("intro", user_text, context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
 
     if any(x in user_text for x in ["так", "да", "ок", "добре", "хочу"]):
+        reply_keyboard = [['Одноденний тур', 'Довгий тур']]
+        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
         await update.message.reply_text(
             "Відповідь менеджера: "
-            "Супер! Скажіть, будь ласка, з якого міста ви б хотіли виїжджати (Ужгород чи Мукачево) "
-            "і скільки у вас дітей?"
+            "Чудово! Який тип туру вас цікавить?",
+            reply_markup=markup
         )
-        return STATE_NEEDS
+        return STATE_TOUR_TYPE
     else:
         await update.message.reply_text(
             "Відповідь менеджера: "
             "Гаразд. Якщо вирішите дізнатися більше — просто напишіть /start або 'Хочу дізнатися'. "
-            "Гарного дня!"
+            "Гарного дня!",
+            reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
 
-async def needs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def tour_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.lower()
+    context.user_data["tour_type"] = user_text
+
+    if "одноденний тур" in user_text:
+        # Для одноденних турів сразу переходите к выявлению потребностей
+        await update.message.reply_text(
+            "Відповідь менеджера: "
+            "Скажіть, будь ласка, з якого міста ви б хотіли виїжджати (Ужгород чи Мукачево)?"
+        )
+        return STATE_NEEDS_CITY
+    elif "довгий тур" in user_text:
+        # Для длительных туров собираем контактные данные
+        await update.message.reply_text(
+            "Відповідь менеджера: "
+            "Щоб підготувати для вас найкращі умови, будь ласка, надайте свої контактні дані (номер телефону або email)."
+        )
+        return STATE_CONTACT_INFO
+    else:
+        await update.message.reply_text(
+            "Відповідь менеджера: "
+            "Будь ласка, оберіть один із запропонованих варіантів.",
+            reply_markup=ReplyKeyboardMarkup(
+                [['Одноденний тур', 'Довгий тур']], 
+                one_time_keyboard=True, 
+                resize_keyboard=True
+            )
+        )
+        return STATE_TOUR_TYPE
+
+async def contact_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
-    context.user_data["needs_info"] = user_text
+    context.user_data["contact_info"] = user_text
+
+    await update.message.reply_text(
+        "Відповідь менеджера: "
+        "Дякую! Тепер скажіть, будь ласка, скільки у вас дітей і якої вікової категорії?"
+    )
+    return STATE_NEEDS_CHILDREN
+
+async def needs_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    context.user_data["departure_city"] = user_text
+
+    await update.message.reply_text(
+        "Відповідь менеджера: "
+        "Скільки у вас дітей і якої вікової категорії?"
+    )
+    return STATE_NEEDS_CHILDREN
+
+async def needs_children_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    context.user_data["children_info"] = user_text
 
     # GPT
-    adv = await invoke_gpt_experts("needs", user_text, context.user_data)
-    logger.info(f"GPT Experts [NEEDS]:\n{adv}")
+    adv = await invoke_gpt("needs_children", user_text, context.user_data)
+    logger.info(f"GPT Experts [NEEDS_CHILDREN]:\n{adv}")
 
     await update.message.reply_text(
         "Відповідь менеджера: "
@@ -158,130 +208,61 @@ async def needs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "завдяки цій поїздці!\n"
         "Дозвольте розповісти трохи про враження, які чекають саме на вас."
     )
-    return STATE_PSYCHO
-
-async def psycho_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-
-    # GPT
-    adv = await invoke_gpt_experts("psycho", user_text, context.user_data)
-    logger.info(f"GPT Experts [PSYCHO]:\n{adv}")
-
-    # Усилим FOMO + соцдоказ
-    await update.message.reply_text(
-        "Відповідь менеджера: "
-        "Наш тур вже обрали понад 200 сімей за останні місяці. Уявіть радість дитини, "
-        "коли вона вперше бачить морських котиків, левів та жирафів буквально у кількох кроках! "
-        "А ви в цей час можете просто насолодитися моментом — усе організовано.\n\n"
-        "За вашим бажанням розкажу детальніше про програму та умови. "
-        "Хочете почути повну презентацію нашого туру?"
-    )
     return STATE_PRESENTATION
 
 async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
+    # Презентация: отражение потребностей, озвучивание цены, обоснование преимуществ
+    departure_city = context.user_data.get("departure_city", "вашого міста")
+    tour_type = context.user_data.get("tour_type", "туру")
+    children_info = context.user_data.get("children_info", "")
 
-    # GPT
-    adv = await invoke_gpt_experts("presentation", user_text, context.user_data)
-    logger.info(f"GPT Experts [PRESENTATION]:\n{adv}")
+    # Пример отправки мультимедийного контента
+    # Вы можете заменить ссылки на реальные изображения или видео
+    media = [
+        InputMediaPhoto(media="https://example.com/photo1.jpg", caption="Огляд зоопарку Ньїредьгаза"),
+        InputMediaPhoto(media="https://example.com/photo2.jpg", caption="Наші комфортні автобуси")
+    ]
+    await update.message.reply_media_group(media=media)
 
-    # Если «да», «так», «хочу» и т.п.
-    if any(x in user_text for x in ["так", "да", "хочу", "детальніше"]):
-        # Усиленная презентация (якорение + психология)
-        await update.message.reply_text(
-            "Відповідь менеджера: "
-            "🔸 *Програма туру*:\n"
-            "  • Виїзд о 2:00 з Ужгорода (або Мукачева) на комфортному автобусі — м'які сидіння, "
-            "зарядки для гаджетів, клімат-контроль.\n"
-            "  • Прибуття до зоопарку Ньїредьгаза близько 10:00. Діти в захваті від "
-            "шоу морських котиків, а ви можете відпочити та зробити купу фото.\n"
-            "  • Далі — обід (не входить у вартість, але можна взяти з собою або купити в кафе).\n"
-            "  • Після зоопарку — заїзд до великого торгового центру: кава, покупки, відпочинок.\n"
-            "  • Повернення додому близько 21:00.\n\n"
-            
-            "🔸 *Чому це вигідно*:\n"
-            "  • Звичайні тури можуть коштувати 2500–3000 грн, і це без гарантій з квитками та "
-            "дитячими розвагами. У нас лише 1900 грн (для дорослих), "
-            "і 1850 для дітей — вже з квитками, страховкою, супроводом.\n"
-            "  • Ми знаємо, що для мами важливо мінімум турбот. Тому все продумано: "
-            "діти зайняті, а ви — відпочиваєте!\n\n"
-            "🔸 *Місця обмежені*: У нас залишається лише кілька вільних місць на найближчі дати.\n\n"
-            "Чи є у вас сумніви або питання? Напишіть, і я з радістю відповім!"
-        )
-        return STATE_OBJECTIONS
-    else:
-        await update.message.reply_text("Відповідь менеджера: Гаразд, якщо зміните думку — я поруч. Гарного дня!")
-        return ConversationHandler.END
-
-async def objections_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-
-    # GPT
-    adv = await invoke_gpt_experts("objections", user_text, context.user_data)
-    logger.info(f"GPT Experts [OBJECTIONS]:\n{adv}")
-
-    if "дорого" in user_text or "ціна" in user_text:
-        await update.message.reply_text(
-            "Відповідь менеджера: "
-            "Розумію ваші хвилювання щодо бюджету. Проте зважте, що в 1900 грн "
-            "вже включені всі квитки, страховка, супровід. "
-            "І ви економите купу часу — не треба шукати, де купити квитки чи як дістатися.\n"
-            "А враження дитини — це безцінно. Як вам такий підхід?"
-        )
-        return STATE_OBJECTIONS
-    elif "безпека" in user_text or "дитина боїться" in user_text or "переживаю" in user_text:
-        await update.message.reply_text(
-            "Відповідь менеджера: "
-            "Ми якраз орієнтуємось на сім'ї з дітьми від 4 років. "
-            "У зоопарку є безпечні зони для малечі, а наш супроводжуючий завжди поруч, "
-            "щоб допомогти і підтримати.\n"
-            "У більшості дітей виявляється навіть більший інтерес, ніж страх!"
-        )
-        return STATE_OBJECTIONS
-    elif any(x in user_text for x in ["ок", "зрозуміло", "гаразд", "не маю"]):
-        await update.message.reply_text(
-            "Відповідь менеджера: "
-            "Супер! Тоді давайте ще раз уточнимо фінальні цифри та умови оплати. Гаразд?"
-        )
-        return STATE_QUOTE
-    else:
-        await update.message.reply_text(
-            "Відповідь менеджера: "
-            "Можливо, є ще якісь сумніви? Спробуйте сформулювати їх."
-        )
-        return STATE_OBJECTIONS
-
-async def quote_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-
-    # GPT
-    adv = await invoke_gpt_experts("quote", user_text, context.user_data)
-    logger.info(f"GPT Experts [QUOTE]:\n{adv}")
+    presentation_text = (
+        "🔸 *Програма туру*:\n"
+        f"  • Виїзд о 2:00 з {departure_city} на комфортному автобусі — м'які сидіння, "
+        "зарядки для гаджетів, клімат-контроль.\n"
+        "  • Прибуття до зоопарку Ньїредьгаза близько 10:00. Діти в захваті від "
+        "шоу морських котиків, а ви можете відпочити та зробити купу фото.\n"
+        "  • Далі — обід (не входить у вартість, але можна взяти з собою або купити в кафе).\n"
+        "  • Після зоопарку — заїзд до великого торгового центру: кава, покупки, відпочинок.\n"
+        "  • Повернення додому близько 21:00.\n\n"
+        
+        "🔸 *Чому це вигідно*:\n"
+        "  • Звичайні тури можуть коштувати 2500–3000 грн, і це без гарантій з квитками та "
+        "дитячими розвагами. У нас лише 1900 грн (для дорослих), "
+        "і 1850 для дітей — вже з квитками, страховкою, супроводом.\n"
+        "  • Ми знаємо, що для мами важливо мінімум турбот. Тому все продумано: "
+        "діти зайняті, а ви — відпочиваєте!\n\n"
+        "🔸 *Місця обмежені*: У нас залишається лише кілька вільних місць на найближчі дати.\n\n"
+        "Чи є у вас сумніви або питання? Напишіть, і я з радістю відповім!"
+    )
 
     await update.message.reply_text(
-        "Відповідь менеджера: "
-        "Отже, підсумуємо:\n"
-        "• Вартість: 1900 грн (дорослий), 1850 грн (дитина).\n"
-        "• Це вже включає всі витрати (трансфер, вхідні квитки, страхування, супровід).\n"
-        "• Для дітей до 6 років передбачені знижки.\n"
-        "• Оплата: 30% передоплата для бронювання місця, решта — за 3 дні до поїздки.\n\n"
-        "Чи є ще якісь питання щодо туру або оплати?"
+        f"Відповідь менеджера: {presentation_text}",
+        parse_mode='Markdown'
     )
-    return STATE_FAQ
+    return STATE_ADDITIONAL_QUESTIONS
 
-async def faq_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
     # GPT
-    adv = await invoke_gpt_experts("faq", user_text, context.user_data)
-    logger.info(f"GPT Experts [FAQ]:\n{adv}")
+    adv = await invoke_gpt("additional_questions", user_text, context.user_data)
+    logger.info(f"GPT Experts [ADDITIONAL_QUESTIONS]:\n{adv}")
 
-    if "так" in user_text or "є питання" in user_text:
+    if any(x in user_text for x in ["так", "да", "хочу", "ще питання", "допомога"]):
         await update.message.reply_text(
             "Відповідь менеджера: "
-            "Звісно, я тут, щоб відповісти на всі ваші питання. Що саме вас цікавить?"
+            "Звісно, я готова відповісти на ваші запитання. Що саме вас цікавить?"
         )
-        return STATE_FAQ
+        return STATE_ADDITIONAL_QUESTIONS
     else:
         await update.message.reply_text(
             "Відповідь менеджера: "
@@ -294,7 +275,7 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
     # GPT
-    adv = await invoke_gpt_experts("feedback", user_text, context.user_data)
+    adv = await invoke_gpt("feedback", user_text, context.user_data)
     logger.info(f"GPT Experts [FEEDBACK]:\n{adv}")
 
     if any(x in user_text for x in ["так", "хочу", "бронюю"]):
@@ -310,7 +291,7 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Розумію. Можливо, ви хочете зарезервувати місце без оплати? "
             "Ми можемо тримати його для вас 24 години."
         )
-        return STATE_RESERVATION
+        return STATE_CLOSE_DEAL
     else:
         await update.message.reply_text(
             "Відповідь менеджера: "
@@ -323,7 +304,7 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
     # GPT
-    adv = await invoke_gpt_experts("payment", user_text, context.user_data)
+    adv = await invoke_gpt("payment", user_text, context.user_data)
     logger.info(f"GPT Experts [PAYMENT]:\n{adv}")
 
     if any(x in user_text for x in ["так", "готовий", "як оплатити"]):
@@ -335,21 +316,21 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Як тільки ми отримаємо підтвердження, я передам вас живому менеджеру "
             "для завершення бронювання. Дякую за довіру!"
         )
-        return STATE_TRANSFER
+        return STATE_CLOSE_DEAL
     else:
         await update.message.reply_text(
             "Відповідь менеджера: "
             "Зрозуміло. Якщо вам потрібен час на роздуми, ми можемо зарезервувати місце на 24 години без оплати. "
             "Хочете скористатися цією можливістю?"
         )
-        return STATE_RESERVATION
+        return STATE_CLOSE_DEAL
 
-async def reservation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
     # GPT
-    adv = await invoke_gpt_experts("reservation", user_text, context.user_data)
-    logger.info(f"GPT Experts [RESERVATION]:\n{adv}")
+    adv = await invoke_gpt("close_deal", user_text, context.user_data)
+    logger.info(f"GPT Experts [CLOSE_DEAL]:\n{adv}")
 
     if any(x in user_text for x in ["так", "хочу", "резервую"]):
         await update.message.reply_text(
@@ -357,44 +338,38 @@ async def reservation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
             "Чудово! Я зарезервувала для вас місце на 24 години. "
             "Протягом цього часу ви можете повернутися та завершити бронювання. "
             "Якщо у вас виникнуть додаткові питання, не соромтеся звертатися. "
-            "Дякую за інтерес до нашого туру!"
+            "Дякую за інтерес до нашого туру!",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return STATE_FINISH
+    elif any(x in user_text for x in ["ні", "не зараз", "подумаю"]):
+        await update.message.reply_text(
+            "Відповідь менеджера: "
+            "Зрозуміло. Якщо ви передумаєте або у вас виникнуть додаткові питання, "
+            "будь ласка, не соромтеся звертатися. Ми завжди раді допомогти!",
+            reply_markup=ReplyKeyboardRemove()
         )
         return STATE_FINISH
     else:
         await update.message.reply_text(
             "Відповідь менеджера: "
-            "Зрозуміло. Якщо ви передумаєте або у вас виникнуть додаткові питання, "
-            "будь ласка, не соромтеся звертатися. Ми завжди раді допомогти!"
+            "Вибачте, я не зовсім зрозуміла вашу відповідь. "
+            "Ви хочете зарезервувати місце зараз чи, можливо, потрібно більше часу на роздуми?"
         )
-        return STATE_FINISH
-
-async def transfer_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-
-    # GPT
-    adv = await invoke_gpt_experts("transfer", user_text, context.user_data)
-    logger.info(f"GPT Experts [TRANSFER]:\n{adv}")
-
-    await update.message.reply_text(
-        "Відповідь менеджера: "
-        "Дякую за вашу оплату! Я передаю вас нашому живому менеджеру для завершення бронювання. "
-        "Він зв'яжеться з вами найближчим часом для уточнення деталей. "
-        "Якщо у вас виникнуть додаткові питання до того часу, не соромтеся звертатися до мене. "
-        "Дякую за вибір нашого туру!"
-    )
-    return STATE_FINISH
+        return STATE_CLOSE_DEAL
 
 async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
     # GPT
-    adv = await invoke_gpt_experts("finish", user_text, context.user_data)
+    adv = await invoke_gpt("finish", user_text, context.user_data)
     logger.info(f"GPT Experts [FINISH]:\n{adv}")
 
     await update.message.reply_text(
         "Відповідь менеджера: "
         "Дякую за спілкування! Якщо у вас виникнуть додаткові питання або ви захочете повернутися "
-        "до бронювання, просто напишіть мені. Бажаю гарного дня!"
+        "до бронювання, просто напишіть мені. Бажаю гарного дня!",
+        reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
 
@@ -404,7 +379,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     logger.info("User %s canceled the conversation.", user.first_name)
     await update.message.reply_text(
         "Відповідь менеджера: "
-        'Дякую за спілкування! Якщо захочете повернутися до бронювання, просто напишіть /start.'
+        'Дякую за спілкування! Якщо захочете повернутися до бронювання, просто напишіть /start.',
+        reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
 
@@ -456,16 +432,15 @@ async def run_bot():
         entry_points=[CommandHandler('start', start_command)],
         states={
             STATE_INTRO: [MessageHandler(filters.TEXT & ~filters.COMMAND, intro_handler)],
-            STATE_NEEDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, needs_handler)],
-            STATE_PSYCHO: [MessageHandler(filters.TEXT & ~filters.COMMAND, psycho_handler)],
+            STATE_TOUR_TYPE: [MessageHandler(filters.Regex('^(Одноденний тур|Довгий тур)$'), tour_type_handler)],
+            STATE_NEEDS_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, needs_city_handler)],
+            STATE_CONTACT_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_info_handler)],
+            STATE_NEEDS_CHILDREN: [MessageHandler(filters.TEXT & ~filters.COMMAND, needs_children_handler)],
             STATE_PRESENTATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, presentation_handler)],
-            STATE_OBJECTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, objections_handler)],
-            STATE_QUOTE: [MessageHandler(filters.TEXT & ~filters.COMMAND, quote_handler)],
-            STATE_FAQ: [MessageHandler(filters.TEXT & ~filters.COMMAND, faq_handler)],
+            STATE_ADDITIONAL_QUESTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, additional_questions_handler)],
             STATE_FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler)],
             STATE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_handler)],
-            STATE_RESERVATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, reservation_handler)],
-            STATE_TRANSFER: [MessageHandler(filters.TEXT & ~filters.COMMAND, transfer_handler)],
+            STATE_CLOSE_DEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_deal_handler)],
             STATE_FINISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_handler)],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
