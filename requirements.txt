@@ -16,7 +16,7 @@ exceptiongroup==1.2.2
 Flask==3.1.0
 frozenlist==1.5.0
 h11==0.14.0
-httpcore==0.17.0  # Совместимая версия
+httpcore==0.17.0
 httpx>=0.24.0,<0.29.0
 idna==3.10
 itsdangerous==2.2.0
@@ -42,3 +42,5 @@ tzlocal==5.2
 urllib3==2.3.0
 Werkzeug==3.1.3
 yarl==1.18.3
+transformers==4.28.1
+torch==2.0.1

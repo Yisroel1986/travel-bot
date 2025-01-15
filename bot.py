@@ -17,6 +17,7 @@ from datetime import timezone, timedelta
 from flask import Flask, request
 import asyncio
 import threading
+from transformers import pipeline
 
 # Включаем логирование
 logging.basicConfig(
@@ -54,6 +55,11 @@ openai.api_key = OPENAI_API_KEY
 # Глобальная переменная для цикла событий бота
 bot_loop = None
 
+# Инициализируйте zero-shot классификатор
+logger.info("Загрузка модели для анализа тональности...")
+sentiment_analyzer = pipeline("zero-shot-classification", model="facebook/bart-large-mnli")
+logger.info("Модель для анализа тональности загружена.")
+
 def is_bot_already_running():
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -63,11 +69,31 @@ def is_bot_already_running():
                 return True
     return False
 
+async def analyze_sentiment(text: str) -> str:
+    candidate_labels = ["позитивний", "негативний", "нейтральний"]
+    try:
+        result = sentiment_analyzer(text, candidate_labels)
+        # Получаем наиболее вероятную категорию
+        top_label = result['labels'][0]
+        return top_label
+    except Exception as e:
+        logger.error(f"Error in sentiment analysis: {e}")
+        return "нейтральний"
+
 async def invoke_gpt(stage: str, user_text: str, context_data: dict):
     """
-    Вызывает OpenAI ChatCompletion с учётом текущего этапа диалога.
+    Вызывает OpenAI ChatCompletion с учётом текущего этапа диалога и тональности.
     Возвращает ответ от модели.
     """
+    sentiment = context_data.get("sentiment", "нейтральний")
+    empathy = ""
+    if sentiment == "негативний":
+        empathy = "Будь ласка, прояви більше емпатії та підтримки у відповіді."
+    elif sentiment == "позитивний":
+        empathy = "Відповідь повинна бути дружньою та позитивною."
+    else:
+        empathy = "Відповідь повинна бути професійною та нейтральною."
+
     system_prompt = f"""
     Ти — команда експертів: SalesGuru, ObjectionsPsychologist, MarketingHacker.
     Урахуй, що наш цільовий клієнт — мама 28-45 років, цінує сім'ю, шукає безпечний і 
@@ -78,6 +104,7 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict):
     якір цін (інші тури дорожчі, але ми даємо те саме, і навіть більше). 
     Стадія: {stage}.
     Повідомлення від користувача: {user_text}.
+    {empathy}
     Відповідь повинна починатися з "Відповідь менеджера:" і бути написана українською мовою.
     """
     messages = [
@@ -122,6 +149,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
+    
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+    
     # GPT
     adv = await invoke_gpt("intro", user_text, context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
@@ -180,6 +212,10 @@ async def contact_info_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user_text = update.message.text
     context.user_data["contact_info"] = user_text
 
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
     await update.message.reply_text(
         "Відповідь менеджера: "
         "Скільки у вас дітей і якої вікової категорії?"
@@ -190,6 +226,10 @@ async def needs_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_text = update.message.text
     context.user_data["departure_city"] = user_text
 
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
     await update.message.reply_text(
         "Скільки у вас дітей і якої вікової категорії?"
     )
@@ -198,6 +238,10 @@ async def needs_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def needs_children_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     context.user_data["children_info"] = user_text
+
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
 
     # GPT
     adv = await invoke_gpt("needs_children", user_text, context.user_data)
@@ -216,35 +260,24 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     departure_city = context.user_data.get("departure_city", "вашого міста")
     tour_type = context.user_data.get("tour_type", "туру")
     children_info = context.user_data.get("children_info", "")
+    contact_info = context.user_data.get("contact_info", "")
 
-    presentation_text = (
-        "🔸 *Програма туру*:\n"
-        f"  • Виїзд о 2:00 з {departure_city} на комфортному автобусі — м'які сидіння, "
-        "зарядки для гаджетів, клімат-контроль.\n"
-        "  • Прибуття до зоопарку Ньїредьгаза близько 10:00. Діти в захваті від "
-        "шоу морських котиків, а ви можете відпочити та зробити купу фото.\n"
-        "  • Далі — обід (не входить у вартість, але можна взяти з собою або купити в кафе).\n"
-        "  • Після зоопарку — заїзд до великого торгового центру: кава, покупки, відпочинок.\n"
-        "  • Повернення додому близько 21:00.\n\n"
-        
-        "🔸 *Чому це вигідно*:\n"
-        "  • Звичайні тури можуть коштувати 2500–3000 грн, і це без гарантій з квитками та "
-        "дитячими розвагами. У нас лише 1900 грн (для дорослих), "
-        "і 1850 для дітей — вже з квитками, страховкою, супроводом.\n"
-        "  • Ми знаємо, що для мами важливо мінімум турбот. Тому все продумано: "
-        "діти зайняті, а ви — відпочиваєте!\n\n"
-        "🔸 *Місця обмежені*: У нас залишається лише кілька вільних місць на найближчі дати.\n\n"
-        "Чи є у вас сумніви або питання? Напишіть, і я з радістю відповім!"
-    )
+    # GPT
+    adv = await invoke_gpt("presentation", "", context.user_data)
+    logger.info(f"GPT Experts [PRESENTATION]:\n{adv}")
 
     await update.message.reply_text(
-        f"Відповідь менеджера: {presentation_text}",
+        f"Відповідь менеджера: {adv}",
         parse_mode='Markdown'
     )
     return STATE_ADDITIONAL_QUESTIONS
 
 async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
+
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
 
     # GPT
     adv = await invoke_gpt("additional_questions", user_text, context.user_data)
@@ -266,6 +299,10 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
 
 async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
+
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
 
     # GPT
     adv = await invoke_gpt("feedback", user_text, context.user_data)
@@ -296,6 +333,10 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
     # GPT
     adv = await invoke_gpt("payment", user_text, context.user_data)
     logger.info(f"GPT Experts [PAYMENT]:\n{adv}")
@@ -320,6 +361,10 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
+
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
 
     # GPT
     adv = await invoke_gpt("close_deal", user_text, context.user_data)
@@ -353,6 +398,10 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
+
+    # Анализ тональности
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
 
     # GPT
     adv = await invoke_gpt("finish", user_text, context.user_data)
