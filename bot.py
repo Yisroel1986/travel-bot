@@ -3,7 +3,7 @@ import logging
 import sys
 import psutil
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InputMediaPhoto
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -13,7 +13,7 @@ from telegram.ext import (
     ContextTypes
 )
 import openai
-from datetime import datetime, timezone, timedelta
+from datetime import timezone, timedelta
 from flask import Flask, request
 import asyncio
 import threading
@@ -152,14 +152,16 @@ async def tour_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Для одноденних турів сразу переходите к выявлению потребностей
         await update.message.reply_text(
             "Відповідь менеджера: "
-            "Скажіть, будь ласка, з якого міста ви б хотіли виїжджати (Ужгород чи Мукачево)?"
+            "Скажіть, будь ласка, з якого міста ви б хотіли виїжджати (Ужгород чи Мукачево)?",
+            reply_markup=ReplyKeyboardRemove()
         )
         return STATE_NEEDS_CITY
     elif "довгий тур" in user_text:
         # Для длительных туров собираем контактные данные
         await update.message.reply_text(
             "Відповідь менеджера: "
-            "Щоб підготувати для вас найкращі умови, будь ласка, надайте свої контактні дані (номер телефону або email)."
+            "Щоб підготувати для вас найкращі умови, будь ласка, надайте свої контактні дані (номер телефону або email).",
+            reply_markup=ReplyKeyboardRemove()
         )
         return STATE_CONTACT_INFO
     else:
@@ -180,7 +182,7 @@ async def contact_info_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
     await update.message.reply_text(
         "Відповідь менеджера: "
-        "Дякую! Тепер скажіть, будь ласка, скільки у вас дітей і якої вікової категорії?"
+        "Скільки у вас дітей і якої вікової категорії?"
     )
     return STATE_NEEDS_CHILDREN
 
@@ -189,7 +191,6 @@ async def needs_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["departure_city"] = user_text
 
     await update.message.reply_text(
-        "Відповідь менеджера: "
         "Скільки у вас дітей і якої вікової категорії?"
     )
     return STATE_NEEDS_CHILDREN
@@ -215,14 +216,6 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     departure_city = context.user_data.get("departure_city", "вашого міста")
     tour_type = context.user_data.get("tour_type", "туру")
     children_info = context.user_data.get("children_info", "")
-
-    # Пример отправки мультимедийного контента
-    # Вы можете заменить ссылки на реальные изображения или видео
-    media = [
-        InputMediaPhoto(media="https://example.com/photo1.jpg", caption="Огляд зоопарку Ньїредьгаза"),
-        InputMediaPhoto(media="https://example.com/photo2.jpg", caption="Наші комфортні автобуси")
-    ]
-    await update.message.reply_media_group(media=media)
 
     presentation_text = (
         "🔸 *Програма туру*:\n"
