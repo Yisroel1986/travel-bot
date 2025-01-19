@@ -19,25 +19,25 @@ import asyncio
 import threading
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Включаем логирование
+# Включаємо логування
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Загружаем переменные окружения из .env
+# Завантажуємо змінні середовища з .env
 load_dotenv()
 
-# Считываем токены из .env
+# Зчитуємо токени з .env
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')  # Замените на ваш URL
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')  # Замість 'https://your-app.onrender.com' вкажіть свій URL
 
-# Назначаем ключ OpenAI
+# Призначаємо ключ OpenAI
 openai.api_key = OPENAI_API_KEY
 
-# Состояния
+# Стани
 (
     STATE_INTRO,
     STATE_TOUR_TYPE,
@@ -52,7 +52,7 @@ openai.api_key = OPENAI_API_KEY
     STATE_FINISH
 ) = range(11)
 
-# Глобальная переменная для цикла событий бота
+# Глобальна змінна для циклу подій бота
 bot_loop = None
 
 def is_bot_already_running():
@@ -64,10 +64,10 @@ def is_bot_already_running():
                 return True
     return False
 
-# Инициализация VADER
-logger.info("Инициализация VADER Sentiment Analyzer...")
+# Ініціалізація VADER
+logger.info("Ініціалізація VADER Sentiment Analyzer...")
 sentiment_analyzer = SentimentIntensityAnalyzer()
-logger.info("VADER Sentiment Analyzer инициализирован.")
+logger.info("VADER Sentiment Analyzer ініціалізований.")
 
 async def analyze_sentiment(text: str) -> str:
     try:
@@ -80,13 +80,13 @@ async def analyze_sentiment(text: str) -> str:
         else:
             return "нейтральний"
     except Exception as e:
-        logger.error(f"Error in sentiment analysis: {e}")
+        logger.error(f"Помилка під час аналізу тональності: {e}")
         return "нейтральний"
 
 async def invoke_gpt(stage: str, user_text: str, context_data: dict):
     """
-    Вызывает OpenAI ChatCompletion с учётом текущего этапа диалога и тональности.
-    Возвращает ответ от модели.
+    Викликає OpenAI ChatCompletion з урахуванням поточного етапу діалогу та тональності.
+    Повертає відповідь від моделі.
     """
     sentiment = context_data.get("sentiment", "нейтральний")
     empathy = ""
@@ -128,32 +128,33 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict):
         return "Відповідь менеджера: На жаль, наразі я не можу відповісти на ваше запитання. Спробуйте пізніше."
 
 def mention_user(update: Update) -> str:
-    """Утиліта для красивого звернення по імені."""
+    """Утіліта для гарного звернення по імені."""
     user = update.effective_user
     if user:
         return user.first_name if user.first_name else "друже"
     return "друже"
 
-# Определение всех обработчиков
+# --- Оновлений початок розмови (без слова "віртуальний") ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
-    # Советы от экспертов
+    # Виклик GPT (для консистентності, як і в оригіналі)
     adv = await invoke_gpt("intro", "/start", context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
 
+    # Текст привітання українською, без "віртуальний менеджер"
     text = (
-        f"Вітання, {user_name}! Я Марія, ваш віртуальний тур-менеджер. "
-        "Дякую, що зацікавились нашою сімейною поїздкою до зоопарку Ньїредьгаза.\n\n"
-        "Це ідеальний спосіб подарувати дитині казку, а собі — відпочинок без зайвих турбот.\n"
-        "Чи можу я поставити кілька уточнюючих питань, щоб ми підібрали найкращий варіант?"
+        f"Добрий день, {user_name}, я Марія, ваш менеджер компанії Family Place. "
+        "Дозвольте задати вам кілька уточнювальних питань? Добре?"
     )
+
     await update.message.reply_text(f"Відповідь менеджера: {text}")
     return STATE_INTRO
+# --- Кінець оновленого вітання ---
 
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
     
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
     
@@ -161,6 +162,7 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     adv = await invoke_gpt("intro", user_text, context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
 
+    # Перевіряємо, чи користувач погоджується (прописані і укр, і рос, і ок тощо)
     if any(x in user_text for x in ["так", "да", "ок", "добре", "хочу"]):
         reply_keyboard = [['Одноденний тур', 'Довгий тур']]
         markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
@@ -184,7 +186,7 @@ async def tour_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["tour_type"] = user_text
 
     if "одноденний тур" in user_text:
-        # Для одноденних турів сразу переходите к выявлению потребностей
+        # Для одноденних турів відразу переходимо до виявлення потреб
         await update.message.reply_text(
             "Відповідь менеджера: "
             "Скажіть, будь ласка, з якого міста ви б хотіли виїжджати (Ужгород чи Мукачево)?",
@@ -192,7 +194,7 @@ async def tour_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return STATE_NEEDS_CITY
     elif "довгий тур" in user_text:
-        # Для длительных туров собираем контактные данные
+        # Для довгих турів збираємо контактні дані
         await update.message.reply_text(
             "Відповідь менеджера: "
             "Щоб підготувати для вас найкращі умови, будь ласка, надайте свої контактні дані (номер телефону або email).",
@@ -215,7 +217,7 @@ async def contact_info_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user_text = update.message.text
     context.user_data["contact_info"] = user_text
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -229,7 +231,7 @@ async def needs_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_text = update.message.text
     context.user_data["departure_city"] = user_text
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -242,7 +244,7 @@ async def needs_children_handler(update: Update, context: ContextTypes.DEFAULT_T
     user_text = update.message.text
     context.user_data["children_info"] = user_text
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -259,7 +261,7 @@ async def needs_children_handler(update: Update, context: ContextTypes.DEFAULT_T
     return STATE_PRESENTATION
 
 async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Презентация: отражение потребностей, озвучивание цены, обоснование преимуществ
+    # Презентація: відображення потреб, озвучування ціни, обґрунтування переваг
     departure_city = context.user_data.get("departure_city", "вашого міста")
     tour_type = context.user_data.get("tour_type", "туру")
     children_info = context.user_data.get("children_info", "")
@@ -278,7 +280,7 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -303,7 +305,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
 async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -336,7 +338,7 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -365,7 +367,7 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -402,7 +404,7 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
 
-    # Анализ тональности
+    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -419,9 +421,9 @@ async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Отменяет и завершает разговор."""
+    """Скасовує та завершує розмову."""
     user = update.message.from_user
-    logger.info("User %s canceled the conversation.", user.first_name)
+    logger.info("User %s скасував(-ла) розмову.", user.first_name)
     await update.message.reply_text(
         "Відповідь менеджера: "
         'Дякую за спілкування! Якщо захочете повернутися до бронювання, просто напишіть /start.',
@@ -429,7 +431,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     )
     return ConversationHandler.END
 
-# Создаем Flask приложение
+# Створюємо Flask-застосунок
 app = Flask(__name__)
 
 @app.route('/')
@@ -441,7 +443,7 @@ def webhook():
     if request.method == "POST":
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
-        # Передаем обновление боту асинхронно
+        # Передаємо оновлення боту асинхронно
         if bot_loop:
             asyncio.run_coroutine_threadsafe(application.process_update(update), bot_loop)
             logger.info("Webhook отримано та передано боту.")
@@ -461,7 +463,7 @@ async def run_bot():
         sys.exit(1)
 
     # Вказуємо часовий пояс
-    tz = timezone(timedelta(hours=2))  # UTC+2 для Києва
+    tz = timezone(timedelta(hours=2))  # UTC+2, наприклад, для Києва
 
     # Логуємо використаний часовий пояс
     logger.info(f"Використаний часовий пояс: {tz}")
@@ -469,10 +471,10 @@ async def run_bot():
     # Створюємо Application
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Встановлюємо часовий пояс у bot_data
+    # Зберігаємо часовий пояс у bot_data
     application.bot_data["timezone"] = tz
 
-    # Створюємо ConversationHandler та додаємо його в додаток
+    # Створюємо ConversationHandler та додаємо його в застосунок
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -496,7 +498,7 @@ async def run_bot():
     # Налаштовуємо webhook
     await setup_webhook(WEBHOOK_URL, application)
 
-    # Ініціалізуємо та запускаємо додаток
+    # Ініціалізуємо та запускаємо застосунок
     await application.initialize()
     await application.start()
 
@@ -504,7 +506,7 @@ async def run_bot():
     bot_loop = asyncio.get_running_loop()
 
     # Бот готовий до обробки вебхуків
-    logger.info("Telegram бот запущено і готовий до обробки вебхуків.")
+    logger.info("Telegram-бот запущений і готовий обробляти вебхуки.")
 
 def start_flask():
     port = int(os.environ.get('PORT', 10000))
@@ -512,10 +514,10 @@ def start_flask():
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
-    # Запускаємо Telegram бота в окремому потоці
+    # Запускаємо Telegram-бот у окремому потоці
     bot_thread = threading.Thread(target=lambda: asyncio.run(run_bot()), daemon=True)
     bot_thread.start()
-    logger.info("Запуск бота в окремому потоці.")
+    logger.info("Бот запущений у окремому потоці.")
 
-    # Запускаємо Flask сервер в основному потоці
+    # Запускаємо Flask-сервер в основному потоці
     start_flask()
