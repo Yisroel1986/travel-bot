@@ -3,6 +3,7 @@ import logging
 import sys
 import psutil
 from dotenv import load_dotenv
+
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application,
@@ -12,7 +13,8 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
 )
-from telegram.request import HTTPXRequest  # <-- ДОБАВЛЕНО
+from telegram.request import HTTPXRequest  # Для расширенных таймаутов
+
 import openai
 from datetime import timezone, timedelta
 from flask import Flask, request
@@ -20,46 +22,40 @@ import asyncio
 import threading
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Включаємо логування
+#
+# --- ЛОГИРОВАНИЕ И НАСТРОЙКИ ---
+#
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Завантажуємо змінні середовища з .env
 load_dotenv()
 
-# Зчитуємо токени з .env
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')  # Замість 'https://your-app.onrender.com' вкажіть свій URL
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 
-# Призначаємо ключ OpenAI
 openai.api_key = OPENAI_API_KEY
 
-# Стани
+# ЭТАПЫ (по сценарию)
 (
-    STATE_INTRO,
-    STATE_TOUR_TYPE,
-    STATE_NEEDS_CITY,
-    STATE_NEEDS_CHILDREN,
-    STATE_CONTACT_INFO,
-    STATE_PRESENTATION,
-    STATE_ADDITIONAL_QUESTIONS,
-    STATE_FEEDBACK,
-    STATE_PAYMENT,
-    STATE_CLOSE_DEAL,
-    STATE_FINISH
-) = range(11)
+    STAGE_INTRO,             # 1. Знакомство
+    STAGE_NEEDS,             # 2. Выявление потребностей
+    STAGE_PRESENTATION,      # 3. Презентация
+    STAGE_ADDITIONAL_QUESTIONS,
+    STAGE_FEEDBACK,          # Обратная связь
+    STAGE_CLOSE,             # 4. Закрытие сделки
+    STAGE_FINISH
+) = range(7)
 
-# Глобальна змінна для циклу подій бота
+# Глобальная переменная для цикла событий
 bot_loop = None
 
 def is_bot_already_running():
     """
-    Проверка, не запущен ли бот повторно.
-    Если находится другой процесс с тем же cmdline — выходим.
+    Проверка, не запущено ли второе копии приложения.
     """
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -75,10 +71,6 @@ sentiment_analyzer = SentimentIntensityAnalyzer()
 logger.info("VADER Sentiment Analyzer ініціалізований.")
 
 async def analyze_sentiment(text: str) -> str:
-    """
-    Анализ тональности текста с помощью VADER.
-    Возвращает 'позитивний', 'негативний' или 'нейтральний'.
-    """
     try:
         scores = sentiment_analyzer.polarity_scores(text)
         compound = scores['compound']
@@ -92,13 +84,12 @@ async def analyze_sentiment(text: str) -> str:
         logger.error(f"Помилка під час аналізу тональності: {e}")
         return "нейтральний"
 
-async def invoke_gpt(stage: str, user_text: str, context_data: dict):
+async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
     """
-    Викликає OpenAI ChatCompletion з урахуванням поточного етапу діалогу та тональності.
-    Повертає відповідь від моделі.
+    Вызывает ChatCompletion GPT, учитывая текущий этап и тональность.
+    Возвращает текст ответа.
     """
     sentiment = context_data.get("sentiment", "нейтральний")
-    empathy = ""
     if sentiment == "негативний":
         empathy = "Будь ласка, прояви більше емпатії та підтримки у відповіді."
     elif sentiment == "позитивний":
@@ -106,294 +97,357 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict):
     else:
         empathy = "Відповідь повинна бути професійною та нейтральною."
 
-    # Системная подсказка для GPT
     system_prompt = f"""
     Ти — команда експертів: SalesGuru, ObjectionsPsychologist, MarketingHacker.
     Урахуй, що наш цільовий клієнт — мама 28-45 років, цінує сім'ю, шукає безпечний і 
     комфортний тур до зоопарку Ньїредьгаза для дитини. 
-    Ми використовуємо жіночий м'який тон, 
-    робимо акценти на відпочинку для мами, на дитячій радості, безпеці. 
-    Застосовуй FOMO (обмеження місць), соціальні докази, 
-    якір цін (інші тури дорожчі, але ми даємо те саме, і навіть більше). 
-    Стадія: {stage}.
-    Повідомлення від користувача: {user_text}.
+    Ми використовуємо жіночий м'який тон, робимо акценти на відпочинку для мами, 
+    на дитячій радості, безпеці. 
+    Застосовуй FOMO (обмеження місць), соціальні докази, якір цін (інші тури дорожчі, але ми даємо те саме).
+    Етап діалогу: {stage}.
+    Повідомлення від клієнта: {user_text}.
     {empathy}
-    Відповідай українською мовою, як справжній менеджер для клієнта.
+    Відповідай українською, як менеджер-людина, без згадок, що ти чат-бот.
+    Коротко, по суті, не перевантажуй зайвим.
     """
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": "Будь ласка, відповідай відповідно до стадії діалогу."}
+        {"role": "user", "content": "Будь ласка, дотримуйся інструкцій."}
     ]
     try:
         response = await openai.ChatCompletion.acreate(
             model="gpt-3.5-turbo",
             messages=messages,
-            max_tokens=1000,
+            max_tokens=800,
             temperature=0.7
         )
         advice_text = response["choices"][0]["message"]["content"]
         return advice_text.strip()
     except Exception as e:
         logger.error(f"Помилка при зверненні до OpenAI: {e}")
-        return "На жаль, наразі я не можу відповісти на ваше запитання. Спробуйте пізніше."
+        return "Вибачте, наразі не можу відповісти. Спробуйте пізніше."
 
 def mention_user(update: Update) -> str:
-    """Утіліта для гарного звернення по імені."""
     user = update.effective_user
-    if user:
-        return user.first_name if user.first_name else "друже"
+    if user and user.first_name:
+        return user.first_name
     return "друже"
 
-# --- Старт діалогу ---
+#
+# Этап 1: Знакомство
+#
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
-    # Тестовый вызов GPT (чтобы сохранить контекст)
-    adv = await invoke_gpt("intro", "/start", context.user_data)
-    logger.info(f"GPT Experts [INTRO]:\n{adv}")
+    _ = await invoke_gpt("intro", "/start", context.user_data)
 
     text = (
-        f"Добрий день, {user_name}, я Марія, ваш менеджер компанії Family Place. "
-        "Дозвольте задати вам кілька уточнювальних питань? Добре?"
+        f"Добрий день, {user_name}. Я Марія, ваш менеджер з туристичних пропозицій. "
+        "Дозвольте поставити кілька уточнювальних питань, щоб краще зрозуміти ваші потреби?"
     )
-
     await update.message.reply_text(text)
-    return STATE_INTRO
+    return STAGE_INTRO
 
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
-    adv = await invoke_gpt("intro", user_text, context.user_data)
-    logger.info(f"GPT Experts [INTRO]:\n{adv}")
-
     if any(x in user_text for x in ["так", "да", "ок", "добре", "хочу"]):
         reply_keyboard = [['Одноденний тур', 'Довгий тур']]
         markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
+
         await update.message.reply_text(
-            "Чудово! Який тип туру вас цікавить?",
+            "Чудово! Який формат вас цікавить: одноденний тур чи більш тривалий?",
             reply_markup=markup
         )
-        return STATE_TOUR_TYPE
+        return STAGE_NEEDS
     else:
         await update.message.reply_text(
-            "Гаразд. Якщо вирішите дізнатися більше — просто напишіть /start або 'Хочу дізнатися'. "
-            "Гарного дня!",
+            "Зрозуміло, тоді не буду вас турбувати. Гарного дня!",
             reply_markup=ReplyKeyboardRemove()
         )
         return ConversationHandler.END
 
-async def tour_type_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+#
+# Этап 2: Выявление потребностей
+#
+async def needs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-    context.user_data["tour_type"] = user_text
+    context.user_data["tour_format"] = user_text
 
-    if "одноденний тур" in user_text:
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    # Если одноденний тур => задаём уточняющие вопросы (город, люди, даты)
+    if "одноденний" in user_text:
         await update.message.reply_text(
-            "Скажіть, будь ласка, з якого міста ви б хотіли виїжджати (Ужгород чи Мукачево)?",
+            "Звідки ви плануєте виїжджати?",
             reply_markup=ReplyKeyboardRemove()
         )
-        return STATE_NEEDS_CITY
-    elif "довгий тур" in user_text:
+        context.user_data["needs_step"] = 1
+        return STAGE_NEEDS
+    elif "довгий" in user_text:
+        # Для длинных туров спросим контактные данные заранее
         await update.message.reply_text(
-            "Щоб підготувати для вас найкращі умови, будь ласка, надайте свої контактні дані (номер телефону або email).",
+            "Тривала подорож передбачає чимало деталей. "
+            "Поділіться, будь ласка, вашим номером телефону чи email, щоб я могла з вами зв'язатися?",
             reply_markup=ReplyKeyboardRemove()
         )
-        return STATE_CONTACT_INFO
+        context.user_data["needs_step"] = 10
+        return STAGE_NEEDS
     else:
+        await update.message.reply_text("Будь ласка, оберіть один із варіантів: Одноденний чи Довгий тур.")
+        return STAGE_NEEDS
+
+async def needs_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    step = context.user_data.get("needs_step", 1)
+    if step == 1:
+        context.user_data["departure_city"] = user_text
+        await update.message.reply_text("Скільки людей планує їхати, і чи будуть діти?")
+        context.user_data["needs_step"] = 2
+        return STAGE_NEEDS
+    elif step == 2:
+        context.user_data["passengers"] = user_text
+        await update.message.reply_text("На які дати ви орієнтуєтеся?")
+        context.user_data["needs_step"] = 3
+        return STAGE_NEEDS
+    elif step == 3:
+        context.user_data["dates"] = user_text
         await update.message.reply_text(
-            "Будь ласка, оберіть один із запропонованих варіантів.",
-            reply_markup=ReplyKeyboardMarkup(
-                [['Одноденний тур', 'Довгий тур']], 
-                one_time_keyboard=True, 
-                resize_keyboard=True
-            )
+            "Дякую, у мене достатньо інформації, щоб запропонувати щось цікаве. "
+            "Можемо переходити до презентації?"
         )
-        return STATE_TOUR_TYPE
+        context.user_data["needs_step"] = 4
+        return STAGE_NEEDS
+    elif step == 4:
+        # Проверяем согласие
+        user_text_lower = user_text.lower()
+        if any(x in user_text_lower for x in ["так", "да", "ок", "добре", "хочу"]):
+            return STAGE_PRESENTATION
+        else:
+            await update.message.reply_text("Гаразд, звертайтеся, якщо передумаєте. Гарного дня!")
+            return ConversationHandler.END
 
-async def contact_info_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    context.user_data["contact_info"] = user_text
+    elif step == 10:
+        context.user_data["contact_info"] = user_text
+        await update.message.reply_text("Дякую! Скажіть, звідки ви плануєте виїжджати?")
+        context.user_data["needs_step"] = 11
+        return STAGE_NEEDS
+    elif step == 11:
+        context.user_data["departure_city"] = user_text
+        await update.message.reply_text("Скільки людей планує поїхати, і чи будуть діти?")
+        context.user_data["needs_step"] = 12
+        return STAGE_NEEDS
+    elif step == 12:
+        context.user_data["passengers"] = user_text
+        await update.message.reply_text("На які дати (або період) ви орієнтуєтеся?")
+        context.user_data["needs_step"] = 13
+        return STAGE_NEEDS
+    elif step == 13:
+        context.user_data["dates"] = user_text
+        await update.message.reply_text(
+            "Прекрасно, тепер можу запропонувати тур. Перейдемо до презентації?"
+        )
+        context.user_data["needs_step"] = 14
+        return STAGE_NEEDS
+    elif step == 14:
+        user_text_lower = user_text.lower()
+        if any(x in user_text_lower for x in ["так", "да", "ок", "добре", "хочу"]):
+            return STAGE_PRESENTATION
+        else:
+            await update.message.reply_text("Добре, тоді пишіть, коли будете готові обговорити деталі.")
+            return ConversationHandler.END
 
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
+    # Неизвестный шаг
+    await update.message.reply_text("Вибачте, не зовсім зрозуміла. Повторіть, будь ласка.")
+    return STAGE_NEEDS
 
-    await update.message.reply_text(
-        "Скільки у вас дітей і якої вікової категорії?"
-    )
-    return STATE_NEEDS_CHILDREN
-
-async def needs_city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    context.user_data["departure_city"] = user_text
-
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    await update.message.reply_text(
-        "Скільки у вас дітей і якої вікової категорії?"
-    )
-    return STATE_NEEDS_CHILDREN
-
-async def needs_children_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text
-    context.user_data["children_info"] = user_text
-
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    adv = await invoke_gpt("needs_children", user_text, context.user_data)
-    logger.info(f"GPT Experts [NEEDS_CHILDREN]:\n{adv}")
-
-    await update.message.reply_text(
-        "Зрозуміла вас. Ви не уявляєте, скільки мам вже змогли перезавантажитись і відпочити "
-        "завдяки цій поїздці!\n"
-        "Дозвольте розповісти трохи про враження, які чекають саме на вас."
-    )
-    return STATE_PRESENTATION
-
+#
+# Этап 3: Презентация
+#
 async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    adv = await invoke_gpt("presentation", "", context.user_data)
-    logger.info(f"GPT Experts [PRESENTATION]:\n{adv}")
+    user_text = update.message.text
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
 
-    await update.message.reply_text(
-        adv,
-        parse_mode='Markdown'
+    departure_city = context.user_data.get("departure_city", "")
+    passengers = context.user_data.get("passengers", "")
+    dates = context.user_data.get("dates", "")
+
+    # «Зеркалим» потребности (боль)
+    reflect_text = (
+        f"Отже, плануєте поїздку з {departure_city}, людей: {passengers}, дати: {dates}. "
+        "Розумію, що для вас важлива зручність та безпека."
     )
-    return STATE_ADDITIONAL_QUESTIONS
 
-async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    adv = await invoke_gpt("additional_questions", user_text, context.user_data)
-    logger.info(f"GPT Experts [ADDITIONAL_QUESTIONS]:\n{adv}")
-
-    if any(x in user_text for x in ["так", "да", "хочу", "ще питання", "допомога"]):
-        await update.message.reply_text(
-            "Звісно, я готова відповісти на ваші запитання. Що саме вас цікавить?"
-        )
-        return STATE_ADDITIONAL_QUESTIONS
-    else:
-        await update.message.reply_text(
-            "Чудово! Тоді давайте перевіримо, чи готові ви до бронювання місця. "
-            "Хочете забронювати місце на найближчу дату?"
-        )
-        return STATE_FEEDBACK
-
-async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    adv = await invoke_gpt("feedback", user_text, context.user_data)
-    logger.info(f"GPT Experts [FEEDBACK]:\n{adv}")
-
-    if any(x in user_text for x in ["так", "хочу", "бронюю"]):
-        await update.message.reply_text(
-            "Чудово! Для бронювання потрібно внести передоплату 30%. "
-            "Ви готові зробити це зараз?"
-        )
-        return STATE_PAYMENT
-    elif any(x in user_text for x in ["ні", "не зараз", "подумаю"]):
-        await update.message.reply_text(
-            "Розумію. Можливо, ви хочете зарезервувати місце без оплати? "
-            "Ми можемо тримати його для вас 24 години."
-        )
-        return STATE_CLOSE_DEAL
-    else:
-        await update.message.reply_text(
-            "Вибачте, я не зовсім зрозуміла вашу відповідь. "
-            "Ви хочете забронювати місце зараз чи, можливо, потрібно більше часу на роздуми?"
-        )
-        return STATE_FEEDBACK
-
-async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    adv = await invoke_gpt("payment", user_text, context.user_data)
-    logger.info(f"GPT Experts [PAYMENT]:\n{adv}")
-
-    if any(x in user_text for x in ["так", "готовий", "як оплатити"]):
-        await update.message.reply_text(
-            "Чудово! Ось наші реквізити для оплати:\n"
-            "[Тут будуть реквізити]\n\n"
-            "Після оплати, будь ласка, надішліть скріншот чеку. "
-            "Як тільки ми отримаємо підтвердження, я передам вас живому менеджеру "
-            "для завершення бронювання. Дякую за довіру!"
-        )
-        return STATE_CLOSE_DEAL
-    else:
-        await update.message.reply_text(
-            "Зрозуміло. Якщо вам потрібен час на роздуми, ми можемо зарезервувати місце на 24 години без оплати. "
-            "Хочете скористатися цією можливістю?"
-        )
-        return STATE_CLOSE_DEAL
-
-async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    adv = await invoke_gpt("close_deal", user_text, context.user_data)
-    logger.info(f"GPT Experts [CLOSE_DEAL]:\n{adv}")
-
-    if any(x in user_text for x in ["так", "хочу", "резервую"]):
-        await update.message.reply_text(
-            "Чудово! Я зарезервувала для вас місце на 24 години. "
-            "Протягом цього часу ви можете повернутися та завершити бронювання. "
-            "Якщо у вас виникнуть додаткові питання, не соромтеся звертатися. "
-            "Дякую за інтерес до нашого туру!",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return STATE_FINISH
-    elif any(x in user_text for x in ["ні", "не зараз", "подумаю"]):
-        await update.message.reply_text(
-            "Зрозуміло. Якщо ви передумаєте або у вас виникнуть додаткові питання, "
-            "будь ласка, не соромтеся звертатися. Ми завжди раді допомогти!",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return STATE_FINISH
-    else:
-        await update.message.reply_text(
-            "Вибачте, я не зовсім зрозуміла вашу відповідь. "
-            "Ви хочете зарезервувати місце зараз чи, можливо, потрібно більше часу на роздуми?"
-        )
-        return STATE_CLOSE_DEAL
-
-async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_text = update.message.text.lower()
-    sentiment = await analyze_sentiment(user_text)
-    context.user_data["sentiment"] = sentiment
-
-    adv = await invoke_gpt("finish", user_text, context.user_data)
-    logger.info(f"GPT Experts [FINISH]:\n{adv}")
-
+    # Сразу спросим, готовы ли услышать цену
     await update.message.reply_text(
-        "Дякую за спілкування! Якщо у вас виникнуть додаткові питання або ви захочете повернутися "
-        "до бронювання, просто напишіть мені. Бажаю гарного дня!",
+        reflect_text + "\n\nМожу назвати вартість і розповісти про переваги. Цікаво?"
+    )
+    context.user_data["presentation_step"] = 1
+    return STAGE_PRESENTATION
+
+async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.lower()
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    step = context.user_data.get("presentation_step", 1)
+
+    if step == 1:
+        if any(x in user_text for x in ["так", "да", "ок", "хочу"]):
+            # Озвучиваем цену
+            await update.message.reply_text(
+                "Вартість для вашої компанії становить 2000 грн (проїзд, вхідні квитки, супровід). "
+                "Хотіли б дізнатися, чому саме така ціна?"
+            )
+            context.user_data["presentation_step"] = 2
+            return STAGE_PRESENTATION
+        else:
+            await update.message.reply_text("Зрозуміла. Якщо зміните рішення — дайте знати.")
+            return ConversationHandler.END
+    elif step == 2:
+        if any(x in user_text for x in ["так", "да", "ок", "хочу"]):
+            await update.message.reply_text(
+                "У цю суму входить не тільки логістика й квитки, а й комфортна програма, "
+                "підтримка 24/7, цікаві екскурсії. "
+                "Є додаткові запитання?"
+            )
+            context.user_data["presentation_step"] = 3
+            return STAGE_PRESENTATION
+        else:
+            await update.message.reply_text(
+                "Добре, не буду вас завантажувати деталями. "
+                "Можливо, у вас є ще запитання щодо туру?"
+            )
+            context.user_data["presentation_step"] = 3
+            return STAGE_PRESENTATION
+    elif step == 3:
+        # Если пользователь говорит "так, є питання", уйдём в доп. вопросы
+        if any(x in user_text for x in ["так", "да", "ок", "хочу", "ще", "есть", "є"]):
+            return STAGE_ADDITIONAL_QUESTIONS
+        else:
+            # Иначе переходим к этапу обратной связи
+            return STAGE_FEEDBACK
+
+    await update.message.reply_text("Вибачте, не розчула. Повторіть, будь ласка.")
+    return STAGE_PRESENTATION
+
+#
+# Дополнительные вопросы
+#
+async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    # Отвечаем коротко через GPT
+    gpt_answer = await invoke_gpt("additional_questions", user_text, context.user_data)
+    await update.message.reply_text(
+        gpt_answer + "\n\nМожливо, є ще якісь запитання?"
+    )
+    return STAGE_ADDITIONAL_QUESTIONS
+
+async def additional_questions_loop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.lower()
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    if any(x in user_text for x in ["ні", "нет", "немає", "все", "достатньо"]):
+        # Переходим к обратной связи
+        await update.message.reply_text("Добре, тоді скажіть, як вам ця пропозиція загалом?")
+        return STAGE_FEEDBACK
+    else:
+        # Снова отвечаем
+        gpt_answer = await invoke_gpt("additional_questions", user_text, context.user_data)
+        await update.message.reply_text(
+            gpt_answer + "\n\nЧи є ще питання?"
+        )
+        return STAGE_ADDITIONAL_QUESTIONS
+
+#
+# Этап обратной связи
+#
+async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    # Здесь оцениваем, готов ли клиент
+    if any(x in user_text.lower() for x in ["подобається", "нрав", "цікаво", "хочу", "купую", "готов"]):
+        await update.message.reply_text(
+            "Чудово! Можемо переходити до оформлення і оплати. Готові?"
+        )
+        return STAGE_CLOSE
+    else:
+        # Предлагаем связаться с менеджером или взять паузу
+        await update.message.reply_text(
+            "Розумію. Якщо потрібно більше часу — будь ласка. "
+            "Можемо обговорити додаткові деталі, або за бажанням передам вас колезі. "
+            "Як вчинемо?"
+        )
+        return STAGE_CLOSE
+
+#
+# Этап 4: Закрытие сделки
+#
+async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_text = update.message.text.lower()
+    sentiment = await analyze_sentiment(user_text)
+    context.user_data["sentiment"] = sentiment
+
+    if any(x in user_text for x in ["так", "оплатити", "готов", "оплата", "давай"]):
+        await update.message.reply_text(
+            "Ось наші реквізити:\n"
+            "Картка: 0000 0000 0000 0000 (Отримувач: Family Place)\n\n"
+            "Після оплати обов'язково повідомте, щоб я підтвердила бронювання!"
+        )
+        return STAGE_FINISH
+    elif any(x in user_text for x in ["менеджер", "людина", "колега"]):
+        await update.message.reply_text(
+            "Добре, передаю ваші контакти колезі, він з вами зв'яжеться. Гарного дня!",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return STAGE_FINISH
+    else:
+        await update.message.reply_text(
+            "Зрозуміла. Якщо з'являться додаткові питання — звертайтесь! Гарного дня!",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return STAGE_FINISH
+
+#
+# Финал
+#
+async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Дякую за звернення! Я на зв'язку, тож пишіть будь-коли.",
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Скасовує та завершує розмову."""
     user = update.message.from_user
-    logger.info("User %s скасував(-ла) розмову.", user.first_name)
+    logger.info("User %s перервав розмову /cancel.", user.first_name)
     await update.message.reply_text(
-        "Дякую за спілкування! Якщо захочете повернутися до бронювання, просто напишіть /start.",
+        "Добре, припиняємо. Якщо захочете повернутися до обговорення — пишіть!",
         reply_markup=ReplyKeyboardRemove()
     )
     return ConversationHandler.END
 
-# Створюємо Flask-застосунок
+#
+# Flask-приложение
+#
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Бот працює!"
+    # Чтобы пользователь, зайдя по корневому URL, не видел "бот".
+    return "Сервер працює!"
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
@@ -402,69 +456,69 @@ def webhook():
         update = Update.de_json(data, application.bot)
         if bot_loop:
             asyncio.run_coroutine_threadsafe(application.process_update(update), bot_loop)
-            logger.info("Webhook отримано та передано боту.")
+            logger.info("Webhook отримано та передано менеджеру.")
         else:
-            logger.error("Цикл подій бота не ініціалізовано.")
+            logger.error("Цикл подій не ініціалізовано.")
     return "OK"
 
 async def setup_webhook(url, application):
-    """
-    Установка вебхука с увеличенным таймаутом.
-    """
     webhook_url = f"{url}/webhook"
-    # Увеличиваем read_timeout (по умолчанию мало, на Render может не хватать)
     await application.bot.set_webhook(webhook_url, read_timeout=40)
     logger.info(f"Webhook встановлено на: {webhook_url}")
 
 async def run_bot():
     global application, bot_loop
     if is_bot_already_running():
-        logger.error("Інша інстанція бота вже запущена. Вихід.")
+        logger.error("Інша інстанція вже запущена. Вихід.")
         sys.exit(1)
 
     tz = timezone(timedelta(hours=2))  # UTC+2
-
     logger.info(f"Використаний часовий пояс: {tz}")
 
-    # Создаём HTTPXRequest с увеличенным connect_timeout/read_timeout
     request = HTTPXRequest(connect_timeout=20, read_timeout=40)
-
-    # Создаём application с этим request
     application_builder = Application.builder().token(BOT_TOKEN).request(request)
     global application
     application = application_builder.build()
 
     application.bot_data["timezone"] = tz
 
-    # Создаём ConversationHandler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
-            STATE_INTRO: [MessageHandler(filters.TEXT & ~filters.COMMAND, intro_handler)],
-            STATE_TOUR_TYPE: [MessageHandler(filters.Regex('^(Одноденний тур|Довгий тур)$'), tour_type_handler)],
-            STATE_NEEDS_CITY: [MessageHandler(filters.TEXT & ~filters.COMMAND, needs_city_handler)],
-            STATE_CONTACT_INFO: [MessageHandler(filters.TEXT & ~filters.COMMAND, contact_info_handler)],
-            STATE_NEEDS_CHILDREN: [MessageHandler(filters.TEXT & ~filters.COMMAND, needs_children_handler)],
-            STATE_PRESENTATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, presentation_handler)],
-            STATE_ADDITIONAL_QUESTIONS: [MessageHandler(filters.TEXT & ~filters.COMMAND, additional_questions_handler)],
-            STATE_FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler)],
-            STATE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_handler)],
-            STATE_CLOSE_DEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_deal_handler)],
-            STATE_FINISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, finish_handler)],
+            STAGE_INTRO: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, intro_handler)
+            ],
+            STAGE_NEEDS: [
+                MessageHandler(filters.Regex('^(Одноденний тур|Довгий тур)$'), needs_handler),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, needs_questions_handler)
+            ],
+            STAGE_PRESENTATION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, presentation_steps_handler),
+            ],
+            STAGE_ADDITIONAL_QUESTIONS: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, additional_questions_loop),
+            ],
+            STAGE_FEEDBACK: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, feedback_handler),
+            ],
+            STAGE_CLOSE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, close_handler),
+            ],
+            STAGE_FINISH: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, finish_handler),
+            ],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
     application.add_handler(conv_handler)
 
-    # Устанавливаем webhook
     await setup_webhook(WEBHOOK_URL, application)
 
-    # Инициализируем и запускаем приложение
     await application.initialize()
     await application.start()
 
     bot_loop = asyncio.get_running_loop()
-    logger.info("Telegram-бот запущений і готовий обробляти вебхуки.")
+    logger.info("Менеджер онлайн і готовий обробляти повідомлення.")
 
 def start_flask():
     port = int(os.environ.get('PORT', 10000))
@@ -472,10 +526,8 @@ def start_flask():
     app.run(host='0.0.0.0', port=port)
 
 if __name__ == '__main__':
-    # Запускаємо Telegram-бот у окремому потоці
     bot_thread = threading.Thread(target=lambda: asyncio.run(run_bot()), daemon=True)
     bot_thread.start()
-    logger.info("Бот запущений у окремому потоці.")
+    logger.info("Запущено менеджера у окремому потоці.")
 
-    # Запускаємо Flask-сервер в основному потоці
     start_flask()
