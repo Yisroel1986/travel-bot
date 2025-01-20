@@ -10,8 +10,9 @@ from telegram.ext import (
     MessageHandler,
     filters,
     ConversationHandler,
-    ContextTypes
+    ContextTypes,
 )
+from telegram.request import HTTPXRequest  # <-- ДОБАВЛЕНО
 import openai
 from datetime import timezone, timedelta
 from flask import Flask, request
@@ -56,6 +57,10 @@ openai.api_key = OPENAI_API_KEY
 bot_loop = None
 
 def is_bot_already_running():
+    """
+    Проверка, не запущен ли бот повторно.
+    Если находится другой процесс с тем же cmdline — выходим.
+    """
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
         if process.info['name'] == current_process.name() and \
@@ -64,12 +69,16 @@ def is_bot_already_running():
                 return True
     return False
 
-# Ініціалізація VADER
+# Инициализация VADER
 logger.info("Ініціалізація VADER Sentiment Analyzer...")
 sentiment_analyzer = SentimentIntensityAnalyzer()
 logger.info("VADER Sentiment Analyzer ініціалізований.")
 
 async def analyze_sentiment(text: str) -> str:
+    """
+    Анализ тональности текста с помощью VADER.
+    Возвращает 'позитивний', 'негативний' или 'нейтральний'.
+    """
     try:
         scores = sentiment_analyzer.polarity_scores(text)
         compound = scores['compound']
@@ -97,7 +106,7 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict):
     else:
         empathy = "Відповідь повинна бути професійною та нейтральною."
 
-    # Удаляем указание «Відповідь повинна починатися з "Відповідь менеджера:"»
+    # Системная подсказка для GPT
     system_prompt = f"""
     Ти — команда експертів: SalesGuru, ObjectionsPsychologist, MarketingHacker.
     Урахуй, що наш цільовий клієнт — мама 28-45 років, цінує сім'ю, шукає безпечний і 
@@ -135,14 +144,13 @@ def mention_user(update: Update) -> str:
         return user.first_name if user.first_name else "друже"
     return "друже"
 
-# --- Оновлений початок розмови (без "віртуальний менеджер" і без префікса) ---
+# --- Старт діалогу ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
-    # Виклик GPT (як і раніше, для консистентності)
+    # Тестовый вызов GPT (чтобы сохранить контекст)
     adv = await invoke_gpt("intro", "/start", context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
 
-    # Текст привітання українською, максимально натуральний
     text = (
         f"Добрий день, {user_name}, я Марія, ваш менеджер компанії Family Place. "
         "Дозвольте задати вам кілька уточнювальних питань? Добре?"
@@ -150,20 +158,15 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(text)
     return STATE_INTRO
-# --- Кінець оновленого вітання ---
 
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-    
-    # Аналіз тональності
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
-    
-    # GPT
+
     adv = await invoke_gpt("intro", user_text, context.user_data)
     logger.info(f"GPT Experts [INTRO]:\n{adv}")
 
-    # Якщо користувач погоджується...
     if any(x in user_text for x in ["так", "да", "ок", "добре", "хочу"]):
         reply_keyboard = [['Одноденний тур', 'Довгий тур']]
         markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
@@ -249,11 +252,6 @@ async def needs_children_handler(update: Update, context: ContextTypes.DEFAULT_T
     return STATE_PRESENTATION
 
 async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    departure_city = context.user_data.get("departure_city", "вашого міста")
-    tour_type = context.user_data.get("tour_type", "туру")
-    children_info = context.user_data.get("children_info", "")
-    contact_info = context.user_data.get("contact_info", "")
-
     adv = await invoke_gpt("presentation", "", context.user_data)
     logger.info(f"GPT Experts [PRESENTATION]:\n{adv}")
 
@@ -265,7 +263,6 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -286,7 +283,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
 
 async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -314,7 +310,6 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -339,7 +334,6 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -371,7 +365,6 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
@@ -407,7 +400,6 @@ def webhook():
     if request.method == "POST":
         data = request.get_json(force=True)
         update = Update.de_json(data, application.bot)
-        # Передаємо оновлення боту асинхронно
         if bot_loop:
             asyncio.run_coroutine_threadsafe(application.process_update(update), bot_loop)
             logger.info("Webhook отримано та передано боту.")
@@ -416,8 +408,12 @@ def webhook():
     return "OK"
 
 async def setup_webhook(url, application):
+    """
+    Установка вебхука с увеличенным таймаутом.
+    """
     webhook_url = f"{url}/webhook"
-    await application.bot.set_webhook(webhook_url)
+    # Увеличиваем read_timeout (по умолчанию мало, на Render может не хватать)
+    await application.bot.set_webhook(webhook_url, read_timeout=40)
     logger.info(f"Webhook встановлено на: {webhook_url}")
 
 async def run_bot():
@@ -426,19 +422,21 @@ async def run_bot():
         logger.error("Інша інстанція бота вже запущена. Вихід.")
         sys.exit(1)
 
-    # Вказуємо часовий пояс
-    tz = timezone(timedelta(hours=2))  # UTC+2, наприклад, для Києва
+    tz = timezone(timedelta(hours=2))  # UTC+2
 
-    # Логуємо використаний часовий пояс
     logger.info(f"Використаний часовий пояс: {tz}")
 
-    # Створюємо Application
-    application = Application.builder().token(BOT_TOKEN).build()
-    
-    # Зберігаємо часовий пояс у bot_data
+    # Создаём HTTPXRequest с увеличенным connect_timeout/read_timeout
+    request = HTTPXRequest(connect_timeout=20, read_timeout=40)
+
+    # Создаём application с этим request
+    application_builder = Application.builder().token(BOT_TOKEN).request(request)
+    global application
+    application = application_builder.build()
+
     application.bot_data["timezone"] = tz
 
-    # Створюємо ConversationHandler та додаємо його в застосунок
+    # Создаём ConversationHandler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -456,20 +454,16 @@ async def run_bot():
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
-
     application.add_handler(conv_handler)
 
-    # Налаштовуємо webhook
+    # Устанавливаем webhook
     await setup_webhook(WEBHOOK_URL, application)
 
-    # Ініціалізуємо та запускаємо застосунок
+    # Инициализируем и запускаем приложение
     await application.initialize()
     await application.start()
 
-    # Отримуємо поточний цикл подій та зберігаємо його в глобальній змінній
     bot_loop = asyncio.get_running_loop()
-
-    # Бот готовий до обробки вебхуків
     logger.info("Telegram-бот запущений і готовий обробляти вебхуки.")
 
 def start_flask():
