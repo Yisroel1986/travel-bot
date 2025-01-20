@@ -5,7 +5,7 @@ import psutil
 from dotenv import load_dotenv
 
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
-from telegram.constants import ChatAction  # <-- исправленный импорт
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -86,14 +86,19 @@ async def analyze_sentiment(text: str) -> str:
         return "нейтральний"
 
 #
-# --- РАСПОЗНАВАНИЕ СОГЛАСИЯ / НЕГАТИВА ---
+# --- РАСПОЗНАВАНИЕ СОГЛАСИЯ / НЕГАТИВА / НЕЙТРАЛЬНОГО ---
 #
 def is_affirmative(user_text: str) -> bool:
+    """
+    Проверяем, есть ли хотя бы одно из слов в user_text,
+    которое можно считать согласием.
+    """
     user_text_lower = user_text.lower()
     affirmatives = [
+        # Расширим "да"
         "так", "да", "ок", "окей", "хочу", "хотим", "продолжай", "продовжуй",
         "yes", "yeah", "yep", "yah", "si", "sí", "oui", "ja", "давай",
-        "добре", "good", "ok", "sure"
+        "добре", "good", "ok", "sure", "можна", "можемо", "конечно", "ага"
     ]
     for word in affirmatives:
         if word in user_text_lower:
@@ -101,12 +106,30 @@ def is_affirmative(user_text: str) -> bool:
     return False
 
 def is_negative(user_text: str) -> bool:
+    """
+    Аналогично проверяем отрицательные слова.
+    """
     user_text_lower = user_text.lower()
     negatives = [
         "нет", "ні", "не хочу", "no", "nope", "не треба",
-        "не надо", "not now", "не готов", "не готова"
+        "не надо", "not now", "не готов", "не готова", "cancel"
     ]
     for word in negatives:
+        if word in user_text_lower:
+            return True
+    return False
+
+def is_neutral_greeting(user_text: str) -> bool:
+    """
+    Иногда пользователь просто здоровается ("Привет", "Hello")
+    или что-то нейтральное вроде "Как дела?", "Спасибо".
+    """
+    user_text_lower = user_text.lower()
+    greetings = [
+        "привет", "здравствуй", "здравствуйте", "hello", "hi", "хай", "thank",
+        "спасибо", "дякую", "как дела", "как твои дела"
+    ]
+    for word in greetings:
         if word in user_text_lower:
             return True
     return False
@@ -156,11 +179,11 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
 # --- ИМИТАЦИЯ ПЕЧАТИ (ChatAction.TYPING) ---
 #
 async def typing_simulation(update: Update, text_to_send: str):
-    # Показываем "typing" (менеджер печатает)
+    # Показываем "typing"
     await update.effective_chat.send_action(ChatAction.TYPING)
+    # Некоторая задержка: 1 сек на каждые 50 символов, но не более 5 сек
     delay = min(5, max(1, len(text_to_send) // 50))
     await asyncio.sleep(delay)
-    # Отправляем само сообщение
     await update.message.reply_text(text_to_send)
 
 def mention_user(update: Update) -> str:
@@ -170,10 +193,15 @@ def mention_user(update: Update) -> str:
     return "друже"
 
 #
-# --- ЭТАП 1: ЗНАКОМСТВО ---
+# ----------------- ЛОГИКА ----------------------
+#
+
+#
+# ЭТАП 1: ЗНАКОМСТВО
 #
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
+    # "прогреваем" GPT, не обязательно, но оставим
     _ = await invoke_gpt("intro", "/start", context.user_data)
 
     text = (
@@ -188,6 +216,7 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
+    # Если явное согласие
     if is_affirmative(user_text):
         reply_keyboard = [['Одноденний тур', 'Довгий тур']]
         markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
@@ -195,27 +224,49 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "Чудово! Який формат вас цікавить: одноденний тур чи більш тривалий?"
         await typing_simulation(update, text)
         return STAGE_NEEDS
-    else:
+
+    # Если явный негатив
+    elif is_negative(user_text):
         text = "Зрозуміло, тоді не буду вас турбувати. Гарного дня!"
         await typing_simulation(update, text)
         return ConversationHandler.END
 
+    # Если просто «Привет» или что-то нейтральное
+    elif is_neutral_greeting(user_text):
+        text = (
+            "Приємно познайомитися! "
+            "Підкажіть, будь ласка, чи зручно вам зараз поговорити про ваші туристичні інтереси?"
+        )
+        await typing_simulation(update, text)
+        return STAGE_INTRO
+
+    # Иначе (непонятный ответ), переспрашиваем
+    else:
+        text = (
+            "Вибачте, я не зовсім зрозуміла. "
+            "Ви дозволяєте поставити кілька уточнювальних питань, щоб підібрати найкращу пропозицію?"
+        )
+        await typing_simulation(update, text)
+        return STAGE_INTRO
+
 #
-# --- ЭТАП 2: ВЫЯВЛЕНИЕ ПОТРЕБНОСТЕЙ ---
+# ЭТАП 2: ВЫЯВЛЕНИЕ ПОТРЕБНОСТЕЙ
 #
 async def needs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.lower()
-    context.user_data["tour_format"] = user_text
-
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
-    if "одноденний" in user_text:
+    # Если пользователь ошибся и написал "однолетний", распознаём как "одноденний"
+    if "одноден" in user_text or "одноле" in user_text:
+        context.user_data["tour_format"] = "одноденний"
         text = "Звідки ви плануєте виїжджати?"
         await typing_simulation(update, text)
         context.user_data["needs_step"] = 1
         return STAGE_NEEDS
-    elif "довгий" in user_text:
+
+    elif "довг" in user_text:
+        context.user_data["tour_format"] = "довгий"
         text = (
             "Тривала подорож передбачає чимало деталей. "
             "Поділіться, будь ласка, вашим номером телефону чи email, щоб я могла з вами зв'язатися?"
@@ -223,6 +274,8 @@ async def needs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await typing_simulation(update, text)
         context.user_data["needs_step"] = 10
         return STAGE_NEEDS
+
+    # Если не узнали, попросим уточнить
     else:
         text = "Будь ласка, оберіть один із варіантів: Одноденний чи Довгий тур."
         await typing_simulation(update, text)
@@ -235,6 +288,7 @@ async def needs_questions_handler(update: Update, context: ContextTypes.DEFAULT_
 
     step = context.user_data.get("needs_step", 1)
 
+    # Шаги для однодневного тура
     if step == 1:
         context.user_data["departure_city"] = user_text
         text = "Скільки людей планує їхати, і чи будуть діти?"
@@ -260,13 +314,21 @@ async def needs_questions_handler(update: Update, context: ContextTypes.DEFAULT_
         return STAGE_NEEDS
 
     elif step == 4:
+        # Если согласен — идём к презентации
         if is_affirmative(user_text):
             return STAGE_PRESENTATION
-        else:
-            text = "Гаразд, звертайтеся, якщо передумаєте. Гарного дня!"
+        # Если явно нет
+        elif is_negative(user_text):
+            text = "Зрозуміло. Якщо передумаєте — пишіть. Гарного дня!"
             await typing_simulation(update, text)
             return ConversationHandler.END
+        # Иначе переспрашиваем
+        else:
+            text = "Перепрошую, чи готові перейти до презентації, чи ще ні?"
+            await typing_simulation(update, text)
+            return STAGE_NEEDS
 
+    # Шаги для длинного тура
     elif step == 10:
         context.user_data["contact_info"] = user_text
         text = "Дякую! Скажіть, звідки ви плануєте виїжджати?"
@@ -298,17 +360,22 @@ async def needs_questions_handler(update: Update, context: ContextTypes.DEFAULT_
     elif step == 14:
         if is_affirmative(user_text):
             return STAGE_PRESENTATION
-        else:
+        elif is_negative(user_text):
             text = "Добре, тоді пишіть, коли будете готові обговорити деталі."
             await typing_simulation(update, text)
             return ConversationHandler.END
+        else:
+            text = "Перепрошую, ви згодні перейти до презентації?"
+            await typing_simulation(update, text)
+            return STAGE_NEEDS
 
+    # fallback
     text = "Вибачте, не зовсім зрозуміла. Повторіть, будь ласка."
     await typing_simulation(update, text)
     return STAGE_NEEDS
 
 #
-# --- ЭТАП 3: ПРЕЗЕНТАЦИЯ ---
+# ЭТАП 3: ПРЕЗЕНТАЦИЯ
 #
 async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -347,10 +414,17 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
             await typing_simulation(update, text)
             context.user_data["presentation_step"] = 2
             return STAGE_PRESENTATION
-        else:
+        elif is_negative(user_text):
             text = "Зрозуміла. Якщо зміните рішення — дайте знати."
             await typing_simulation(update, text)
             return ConversationHandler.END
+        else:
+            text = (
+                "Перепрошую, не впевнена, чи бажаєте ви почути вартість. "
+                "Напишіть, будь ласка, 'так' або 'ні'."
+            )
+            await typing_simulation(update, text)
+            return STAGE_PRESENTATION
 
     elif step == 2:
         if is_affirmative(user_text):
@@ -362,7 +436,7 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
             await typing_simulation(update, text)
             context.user_data["presentation_step"] = 3
             return STAGE_PRESENTATION
-        else:
+        elif is_negative(user_text):
             text = (
                 "Добре, не буду вас завантажувати деталями. "
                 "Можливо, у вас є ще запитання щодо туру?"
@@ -370,19 +444,29 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
             await typing_simulation(update, text)
             context.user_data["presentation_step"] = 3
             return STAGE_PRESENTATION
+        else:
+            text = "Вибачте, я не зовсім зрозуміла. Цікавить, чому така ціна, чи ні?"
+            await typing_simulation(update, text)
+            return STAGE_PRESENTATION
 
     elif step == 3:
+        # Если пользователь говорит "да" => идём к доп. вопросам
         if is_affirmative(user_text):
             return STAGE_ADDITIONAL_QUESTIONS
-        else:
+        elif is_negative(user_text):
             return STAGE_FEEDBACK
+        else:
+            # Нейтральный ответ => переспросим
+            text = "Можливо, у вас є питання щодо умов туру або дати виїзду?"
+            await typing_simulation(update, text)
+            return STAGE_PRESENTATION
 
     text = "Вибачте, не розчула. Повторіть, будь ласка."
     await typing_simulation(update, text)
     return STAGE_PRESENTATION
 
 #
-# --- ДОПОЛНИТЕЛЬНЫЕ ВОПРОСЫ ---
+# ДОПОЛНИТЕЛЬНЫЕ ВОПРОСЫ
 #
 async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -410,7 +494,7 @@ async def additional_questions_loop(update: Update, context: ContextTypes.DEFAUL
         return STAGE_ADDITIONAL_QUESTIONS
 
 #
-# --- ЭТАП ОБРАТНОЙ СВЯЗИ ---
+# ЭТАП ОБРАТНОЙ СВЯЗИ
 #
 async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -423,16 +507,22 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await typing_simulation(update, text)
         return STAGE_CLOSE
-    else:
+    elif is_negative(user_text):
         text = (
             "Розумію. Якщо потрібно більше часу — будь ласка. "
             "Можемо обговорити деталі або передам вас колезі. Як вчинемо?"
         )
         await typing_simulation(update, text)
         return STAGE_CLOSE
+    else:
+        text = (
+            "Вибачте, не зовсім зрозуміла вашу оцінку. Сподобалась пропозиція чи маєте сумніви?"
+        )
+        await typing_simulation(update, text)
+        return STAGE_FEEDBACK
 
 #
-# --- ЭТАП ЗАКРЫТИЯ СДЕЛКИ ---
+# ЭТАП ЗАКРЫТИЯ СДЕЛКИ
 #
 async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
@@ -451,13 +541,20 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "Добре, передаю ваші контакти колезі. Гарного дня!"
         await typing_simulation(update, text)
         return STAGE_FINISH
-    else:
+    elif is_negative(user_text):
         text = "Зрозуміла. Якщо з'являться питання — звертайтеся будь-коли!"
         await typing_simulation(update, text)
         return STAGE_FINISH
+    else:
+        # Нейтральное что-то
+        text = (
+            "Вибачте, я не зрозуміла, чи готові ви до оплати або маєте додаткові питання?"
+        )
+        await typing_simulation(update, text)
+        return STAGE_CLOSE
 
 #
-# --- ФИНАЛ ---
+# ФИНАЛ
 #
 async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "Дякую за звернення! Я на зв'язку, тож пишіть у будь-який час."
@@ -465,7 +562,7 @@ async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 #
-# --- CANCEL ---
+# CANCEL
 #
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.message.from_user
