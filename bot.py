@@ -23,6 +23,9 @@ import asyncio
 import threading
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
+# Импортируем GoogleTranslator из deep_translator
+from deep_translator import GoogleTranslator
+
 #
 # --- LOGGING AND SETTINGS ---
 #
@@ -342,6 +345,10 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_text = update.message.text
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
+
+    # Заменяем вызов googletrans на deep-translator, если необходимо
+    # Например, перевод входящего сообщения на нужный язык перед отправкой GPT
+    # Здесь показан пример использования GPT, так что возможно, вам не нужен перевод
 
     gpt_answer = await invoke_gpt("additional_questions", user_text, context.user_data)
     text = gpt_answer + "\n\nЧи є ще запитання?"
