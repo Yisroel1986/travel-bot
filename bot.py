@@ -25,7 +25,7 @@ import asyncio
 import threading
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Імпорт GoogleTranslator з deep_translator (за потреби)
+# ИМПОРТ (если нужно) из deep_translator
 from deep_translator import GoogleTranslator
 
 #
@@ -80,7 +80,7 @@ sentiment_analyzer = SentimentIntensityAnalyzer()
 logger.info("VADER Sentiment Analyzer initialized.")
 
 async def analyze_sentiment(text: str) -> str:
-    """Визначаємо загальний настрій (позитивний, негативний, нейтральний)."""
+    """Определяем общий тон (позитив, негатив, нейтрал)."""
     try:
         scores = sentiment_analyzer.polarity_scores(text)
         compound = scores['compound']
@@ -95,10 +95,7 @@ async def analyze_sentiment(text: str) -> str:
         return "нейтральний"
 
 def detect_fear_keywords(text: str) -> bool:
-    """
-    Перевіряє, чи є слова, що вказують на занепокоєння безпекою або страх.
-    Наприклад, 'боюся', 'переживаю', 'небезпечно', 'страх', 'турбуюсь' і т.д.
-    """
+    """Проверяем, нет ли слов, указывающих на сильное беспокойство/страх."""
     fear_related = ["боюся", "переживаю", "страх", "хвилюю", "небезпечно", "тривожить", "турбую"]
     text_lower = text.lower()
     return any(keyword in text_lower for keyword in fear_related)
@@ -107,13 +104,9 @@ def detect_fear_keywords(text: str) -> bool:
 # --- GPT INTERACTION ---
 #
 async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
-    """
-    Викликаємо GPT для отримання відповіді.
-    Підлаштовуємося під настрій (sentiment) та перевіряємо, чи немає "тривожних" слів.
-    """
+    """Вызов GPT для гибкого ответа."""
     sentiment = context_data.get("sentiment", "нейтральний")
 
-    # Базовий емпатійний чи позитивний/нейтральний prompt
     if sentiment == "негативний":
         empathy = "Будь ласка, прояви більше емпатії та підтримки у відповіді."
     elif sentiment == "позитивний":
@@ -121,11 +114,9 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
     else:
         empathy = "Відповідь повинна бути професійною та нейтральною."
 
-    # Якщо є слова страху чи занепокоєння про безпеку, додаємо це до prompt:
     if detect_fear_keywords(user_text):
         empathy += (
-            " Клієнт явно хвилюється щодо безпеки. Детально опиши заходи безпеки та страхування. "
-            "Поясни, що з дитиною все буде гаразд."
+            " Клієнт хвилюється щодо безпеки. Опиши докладно заходи безпеки й страхування."
         )
 
     system_prompt = f"""
@@ -179,16 +170,8 @@ def is_negative(user_text: str) -> bool:
     ]
     return any(word in user_text_lower for word in negatives)
 
-def is_neutral_greeting(user_text: str) -> bool:
-    user_text_lower = user_text.lower()
-    greetings = [
-        "привіт", "вітаю", "доброго дня", "добрий день", "здравствуйте", 
-        "hello", "hi", "хай", "thank", "спасибі", "дякую", "як справи"
-    ]
-    return any(word in user_text_lower for word in greetings)
-
 async def typing_simulation(update: Update, text: str):
-    """Імітуємо 'typing' і надсилаємо повідомлення без додаткової клавіатури."""
+    """Имитируем typing и отправляем ответ."""
     await update.effective_chat.send_action(ChatAction.TYPING)
     delay = min(5, max(1, len(text) // 50))
     await asyncio.sleep(delay)
@@ -202,7 +185,6 @@ def mention_user(update: Update) -> str:
 # --- SQLITE DB ---
 #
 def init_db():
-    """Створюємо (за потреби) таблицю для збереження стану розмови."""
     conn = sqlite3.connect("bot_database.db")
     c = conn.cursor()
     c.execute("""
@@ -217,7 +199,6 @@ def init_db():
     conn.close()
 
 def load_user_state(user_id: str):
-    """Завантажуємо стан розмови з БД (current_stage, user_data)."""
     conn = sqlite3.connect("bot_database.db")
     c = conn.cursor()
     c.execute("SELECT current_stage, user_data FROM conversation_state WHERE user_id = ?", (user_id,))
@@ -228,7 +209,6 @@ def load_user_state(user_id: str):
     return None, None
 
 def save_user_state(user_id: str, current_stage: int, user_data: dict):
-    """Зберігаємо (або оновлюємо) стан розмови в БД."""
     conn = sqlite3.connect("bot_database.db")
     c = conn.cursor()
     user_data_json = json.dumps(user_data, ensure_ascii=False)
@@ -246,27 +226,23 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    init_db()  # Ініціалізація бази (на випадок, якщо ще не існує)
+    init_db()  # Инициализация базы
 
-    # Перевіримо, чи вже є запис у БД
+    # Проверим, есть ли сохранённое состояние
     saved_stage, saved_user_data_json = load_user_state(user_id)
-
     if saved_stage is not None and saved_user_data_json is not None:
-        # Запитаємо, чи хоче користувач продовжити
+        # Предложим продолжить или начать заново
         context.user_data.update(json.loads(saved_user_data_json))
         text = (
-            "Привіт знову! Ви маєте незавершену розмову з ботом. "
-            "Бажаєте продовжити з того ж місця чи почати заново?\n\n"
-            "Введіть 'Продовжити' або 'Почати знову'."
+            "Привіт знову! Ви маєте незавершену розмову. "
+            "Бажаєте продовжити з того ж місця або почати заново?\n\n"
+            "Введіть 'Продовжити' чи 'Почати знову'."
         )
         await typing_simulation(update, text)
-        # Збережемо stage на якийсь "проміжний" -2 (штучно) або залишимо?
-        # Для спрощення: збережемо, що наступне повідомлення обробимо на STAGE_INTRO.
         return STAGE_INTRO
     else:
-        # Якщо немає запису, починаємо діалог з нуля
+        # Начинаем с нуля
         user_name = mention_user(update)
-        # Перший скриптовий запит
         text = (
             f"Привіт, {user_name}!\n"
             "Я Марія, Ваш менеджер компанії Family Place. "
@@ -277,22 +253,19 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return STAGE_INTRO
 
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Здесь убираем вызов GPT, чтобы не дублировать приветствие."""
     user_id = str(update.effective_user.id)
     user_text = update.message.text
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
-    # Вызываем GPT для более живого ответа на этапе INTRO
-    gpt_answer = await invoke_gpt("intro", user_text, context.user_data)
-    # Чтобы не перезапутывать логику, можно добавить наш традиционный вывод
-    # но пусть бот первым делом отвечает GPT'шной фразой:
-    await typing_simulation(update, gpt_answer)
-
+    # Дальше только логика проверок
     if is_affirmative(user_text):
         text = "Чудово! Який тип туру вас цікавить? (Одноденний чи довгий)"
         await typing_simulation(update, text)
         save_user_state(user_id, STAGE_NEEDS, context.user_data)
         return STAGE_NEEDS
+
     elif is_negative(user_text):
         text = (
             "Зрозуміло. Якщо передумаєте — пишіть. "
@@ -301,28 +274,24 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await typing_simulation(update, text)
         save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
         return STAGE_ADDITIONAL_QUESTIONS
+
     else:
-        # Якщо користувач набрав щось інше, можна запропонувати логіку
-        # "Продовжити" чи "Почати знову" (якщо повернувся?)
-        # або уточнити, що хотів сказати
+        # Логика: "Продовжити" или "Почати знову"
         if user_text.lower().startswith("продовжити"):
-            # Якщо в БД був збережений stage != None
             saved_stage, saved_user_data_json = load_user_state(user_id)
             if saved_stage is not None:
-                # Відновимо user_data
                 context.user_data.update(json.loads(saved_user_data_json))
-                text = "Повертаємось до вашої попередньої розмови. Можемо продовжувати!"
+                text = "Повертаємось до вашої попередньої розмови."
                 await typing_simulation(update, text)
-                # Повертаємось туди, де зупинилися
                 return saved_stage
             else:
-                text = "Немає збережених даних. Почнемо заново."
+                text = "Немає даних. Почнемо заново. Який тип туру вас цікавить?"
                 await typing_simulation(update, text)
-                save_user_state(user_id, STAGE_INTRO, context.user_data)
-                return STAGE_INTRO
+                save_user_state(user_id, STAGE_NEEDS, context.user_data)
+                return STAGE_NEEDS
         elif user_text.lower().startswith("почати знову"):
             context.user_data.clear()
-            text = "Почнемо з початку. Який тип туру вас цікавить? (Одноденний чи довгий)"
+            text = "Гаразд, почнімо з нуля. Який тип туру вас цікавить?"
             await typing_simulation(update, text)
             save_user_state(user_id, STAGE_NEEDS, context.user_data)
             return STAGE_NEEDS
@@ -339,12 +308,11 @@ async def needs_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
-    # GPT, щоб уточнити тур
+    # Здесь уже можно вызывать GPT
     gpt_answer = await invoke_gpt("needs", user_text, context.user_data)
     await typing_simulation(update, gpt_answer)
 
     context.user_data["tour_type"] = user_text.lower()
-    
     text = "З якого міста Ви плануєте подорож?"
     await typing_simulation(update, text)
     save_user_state(user_id, STAGE_CITY, context.user_data)
@@ -361,7 +329,6 @@ async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await typing_simulation(update, gpt_answer)
 
     context.user_data["departure_city"] = user_text
-    
     text = "Для кого плануєте подорож?"
     await typing_simulation(update, text)
     save_user_state(user_id, STAGE_TRAVELERS, context.user_data)
@@ -378,7 +345,6 @@ async def travelers_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await typing_simulation(update, gpt_answer)
 
     context.user_data["travelers"] = user_text
-    
     text = "Скільки років дитині?"
     await typing_simulation(update, text)
     save_user_state(user_id, STAGE_CHILD_AGE, context.user_data)
@@ -419,12 +385,10 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
-    # Якщо це довгий тур, вважаємо, що користувач надав контактні дані
     tour_type = context.user_data.get("tour_type", "")
     if "довг" in tour_type and "contact_info" not in context.user_data:
         context.user_data["contact_info"] = user_text
 
-    # Викликаємо GPT, щоб він адаптувався до відповідей користувача
     gpt_answer = await invoke_gpt("presentation", user_text, context.user_data)
     await typing_simulation(update, gpt_answer)
 
@@ -650,7 +614,6 @@ async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Чим ще можу допомогти?"
     )
     await typing_simulation(update, text)
-    # Повертаємось до додаткових питань, щоб не обривати розмову
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
     return STAGE_ADDITIONAL_QUESTIONS
 
@@ -662,8 +625,6 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         "Якщо виникнуть питання — завжди можете звернутись!"
     )
     await typing_simulation(update, text)
-
-    # Продовжуємо діалог на додаткових питаннях
     user_id = str(update.effective_user.id)
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
     return STAGE_ADDITIONAL_QUESTIONS
