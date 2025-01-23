@@ -4,7 +4,7 @@ import sys
 import psutil
 from dotenv import load_dotenv
 
-from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram import Update, ReplyKeyboardRemove
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -23,7 +23,7 @@ import asyncio
 import threading
 from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
-# Импортируем GoogleTranslator из deep_translator
+# Імпорт GoogleTranslator з deep_translator (якщо потрібен для розширених перекладів)
 from deep_translator import GoogleTranslator
 
 #
@@ -166,7 +166,7 @@ async def typing_simulation(update: Update, text: str):
     await update.effective_chat.send_action(ChatAction.TYPING)
     delay = min(5, max(1, len(text) // 50))
     await asyncio.sleep(delay)
-    await update.message.reply_text(text)
+    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
 def mention_user(update: Update) -> str:
     user = update.effective_user
@@ -178,11 +178,11 @@ def mention_user(update: Update) -> str:
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_name = mention_user(update)
+    # Перший обов'язковий скриптовий запит:
     text = (
-        f"Вітання, {user_name}! Я Марія, ваш тур-менеджер. "
-        "Дякую, що зацікавились нашою сімейною поїздкою до зоопарку Ньїредьгаза. "
-        "\n\nЦе ідеальний спосіб подарувати дитині казку, а собі — відпочинок без зайвих турбот. "
-        "\n\nЧи можу я поставити кілька уточнюючих питань, щоб ми підібрали найкращий варіант?"
+        f"Привіт, {user_name}!\n"
+        "Я Марія, Ваш менеджер компанії Family Place. "
+        "Дозвольте поставити кілька уточнюючих питань, добре?"
     )
     await typing_simulation(update, text)
     return STAGE_INTRO
@@ -193,16 +193,20 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sentiment"] = sentiment
 
     if is_affirmative(user_text):
-        reply_keyboard = [['Одноденний тур', 'Довгий тур']]
-        markup = ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
-        text = "Чудово! Який тип туру вас цікавить?"
-        await update.message.reply_text(text, reply_markup=markup)
+        # Забираємо клавіатуру-вибір туру, просто питаємо текстом
+        text = "Чудово! Який тип туру вас цікавить? (Одноденний чи довгий)"
+        await typing_simulation(update, text)
         return STAGE_NEEDS
     elif is_negative(user_text):
-        text = "Зрозуміло. Якщо передумаєте - пишіть. Гарного дня!"
+        # Раніше тут завершувався діалог, тепер переносимо користувача на питання/спілкування далі
+        text = (
+            "Зрозуміло. Якщо передумаєте — пишіть. "
+            "Чи можемо обговорити інші деталі?"
+        )
         await typing_simulation(update, text)
-        return ConversationHandler.END
+        return STAGE_ADDITIONAL_QUESTIONS
     else:
+        # Повторно просимо підтвердження
         text = "Вибачте, я не зовсім зрозуміла. Можемо обговорити деталі туру?"
         await typing_simulation(update, text)
         return STAGE_INTRO
@@ -278,6 +282,7 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
     context.user_data["sentiment"] = sentiment
     step = context.user_data.get("presentation_step", 1)
 
+    # Крок 1
     if step == 1:
         if is_affirmative(user_text):
             tour_type = context.user_data.get("tour_type", "")
@@ -296,15 +301,17 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
             return STAGE_PRESENTATION
         
         elif is_negative(user_text):
-            text = "Зрозуміла. Якщо з'являться питання — звертайтеся."
+            # Раніше завершувався діалог, тепер відправляємо до STAGE_ADDITIONAL_QUESTIONS
+            text = "Зрозуміла. Якщо з'являться питання — звертайтеся. Можливо, маєте інші запитання?"
             await typing_simulation(update, text)
-            return ConversationHandler.END
+            return STAGE_ADDITIONAL_QUESTIONS
         
         else:
             text = "Вибачте, не зрозуміла. Хочете дізнатися про вартість туру?"
             await typing_simulation(update, text)
             return STAGE_PRESENTATION
 
+    # Крок 2
     elif step == 2:
         if is_affirmative(user_text):
             text = (
@@ -331,6 +338,7 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
             await typing_simulation(update, text)
             return STAGE_PRESENTATION
 
+    # Крок 3
     elif step == 3:
         if is_affirmative(user_text):
             return STAGE_ADDITIONAL_QUESTIONS
@@ -345,10 +353,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_text = update.message.text
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
-
-    # Заменяем вызов googletrans на deep-translator, если необходимо
-    # Например, перевод входящего сообщения на нужный язык перед отправкой GPT
-    # Здесь показан пример использования GPT, так что возможно, вам не нужен перевод
 
     gpt_answer = await invoke_gpt("additional_questions", user_text, context.user_data)
     text = gpt_answer + "\n\nЧи є ще запитання?"
@@ -376,7 +380,10 @@ async def feedback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["sentiment"] = sentiment
 
     if is_affirmative(user_text):
-        text = "Чудово! Можемо переходити до оформлення? Потрібно буде внести передоплату для бронювання місць."
+        text = (
+            "Чудово! Можемо переходити до оформлення? "
+            "Потрібно буде внести передоплату для бронювання місць."
+        )
         await typing_simulation(update, text)
         return STAGE_CLOSE
     elif is_negative(user_text):
@@ -414,7 +421,7 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await typing_simulation(update, text)
         return STAGE_CLOSE
     elif is_negative(user_text):
-        text = "Дякую за інтерес! Якщо передумаєте - пишіть, завжди рада допомогти."
+        text = "Дякую за інтерес! Якщо передумаєте — пишіть, завжди рада допомогти."
         await typing_simulation(update, text)
         return STAGE_FINISH
     else:
@@ -423,19 +430,24 @@ async def close_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return STAGE_CLOSE
 
 async def finish_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Раніше завершували розмову, тепер повертаємо до блоку додаткових питань
     text = (
-        "Дякую за звернення! Я завжди на зв'язку, "
-        "тож якщо виникнуть питання - пишіть у будь-який час."
+        "Дякую за звернення! Я завжди на зв'язку. "
+        "Якщо виникнуть питання — пишіть у будь-який час.\n\n"
+        "Чим ще можу допомогти?"
     )
     await typing_simulation(update, text)
-    return ConversationHandler.END
+    return STAGE_ADDITIONAL_QUESTIONS
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.message.from_user
-    logger.info("User %s cancelled the conversation.", user.first_name)
-    text = "Добре, завершуємо. Якщо захочете повернутися до розмови - напишіть /start"
+    logger.info("User %s tried to cancel the conversation.", user.first_name)
+    text = (
+        "Гаразд, ми не будемо зараз завершувати. "
+        "Якщо виникнуть питання — завжди можете звернутись!"
+    )
     await typing_simulation(update, text)
-    return ConversationHandler.END
+    return STAGE_ADDITIONAL_QUESTIONS
 
 #
 # --- FLASK APP ---
@@ -486,7 +498,6 @@ async def run_bot():
                 MessageHandler(filters.TEXT & ~filters.COMMAND, intro_handler)
             ],
             STAGE_NEEDS: [
-                MessageHandler(filters.Regex('^(Одноденний тур|Довгий тур)$'), needs_handler),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, needs_handler)
             ],
             STAGE_CITY: [
@@ -512,7 +523,7 @@ async def run_bot():
             ],
             STAGE_FINISH: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, finish_handler)
-            ]
+            ],
         },
         fallbacks=[CommandHandler('cancel', cancel)]
     )
