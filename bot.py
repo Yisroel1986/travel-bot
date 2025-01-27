@@ -42,7 +42,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://travel-bot-5u6d.onrender.com')
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 
 openai.api_key = OPENAI_API_KEY
 
@@ -61,8 +61,8 @@ openai.api_key = OPENAI_API_KEY
 
 bot_loop = None
 
-# --- Настройка задержки для follow-up
-FOLLOWUP_DELAY_SECONDS = 120  # например, 2 минуты
+# --- FOLLOWUP DELAY
+FOLLOWUP_DELAY_SECONDS = 120  # для примера 2 минуты
 
 #
 # --- CHECK IF BOT IS ALREADY RUNNING ---
@@ -70,10 +70,12 @@ FOLLOWUP_DELAY_SECONDS = 120  # например, 2 минуты
 def is_bot_already_running():
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
-        if process.info['name'] == current_process.name() and \
-           process.info['cmdline'] == current_process.cmdline() and \
-           process.info['pid'] != current_process.pid:
-                return True
+        if (
+            process.info['name'] == current_process.name()
+            and process.info['cmdline'] == current_process.cmdline()
+            and process.info['pid'] != current_process.pid
+        ):
+            return True
     return False
 
 #
@@ -105,6 +107,15 @@ def is_negative(user_text: str) -> bool:
         "відміна", "скасувати", "пізніше", "не цікавить"
     ]
     return any(word in user_text_lower for word in negatives)
+
+def user_travels_alone(user_text: str) -> bool:
+    """
+    Простейшая проверка, чтобы понять, что человек путешествует один:
+    ловим фразы вроде 'только я', 'один', 'сам', 'лишь я', etc.
+    """
+    solo_keywords = ["только", "сам", "один", "лишь я", "лишь я", "solo"]
+    text_lower = user_text.lower()
+    return any(keyword in text_lower for keyword in solo_keywords)
 
 async def analyze_sentiment(text: str) -> str:
     """Определяем общий тон (позитив, негатив, нейтрал)."""
@@ -140,40 +151,41 @@ def detect_price_keywords(text: str) -> bool:
 # --- GPT INTERACTION ---
 #
 async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
+    """
+    Формируем prompt для GPT. 
+    Если user_data["solo"] == True, просим не упоминать детей.
+    Также просим отвечать без "Доброго дня!" и прочих приветствий.
+    """
     sentiment = context_data.get("sentiment", "нейтральний")
 
+    # Базовая эмпатия
     if sentiment == "негативний":
-        empathy = "Будь ласка, прояви більше емпатії та підтримки у відповіді."
+        empathy = "Будь ласка, прояви більше емпатії та підтримки."
     elif sentiment == "позитивний":
-        empathy = "Відповідь повинна бути дружньою та позитивною."
+        empathy = "Відповідай коротко та позитивно."
     else:
-        empathy = "Відповідь повинна бути професійною та нейтральною."
+        empathy = "Відповідай коротко, по суті та професійно."
 
+    # Доп. логика: не упоминать детей, если solo
+    if context_data.get("solo", False):
+        empathy += " Клієнт подорожує один, не згадуй дітей."
+
+    # Если есть слова страхов
     if detect_fear_keywords(user_text):
-        empathy += (
-            " Клієнт хвилюється щодо безпеки. "
-            "Опиши докладно заходи безпеки й страхування, заспокой його."
-        )
-
+        empathy += " Клієнт хвилюється щодо безпеки. Опиши заходи безпеки та страхування."
+    # Если жалобы на цену
     if detect_price_keywords(user_text):
-        empathy += (
-            " Клієнт вважає, що ціна зависока. "
-            "Поясни, чому це вигідна пропозиція, звернись до якірної ціни, "
-            "соціальних доказів, бонусів тощо."
-        )
+        empathy += " Клієнт вважає, що ціна зависока. Поясни вигоду і якірну ціну."
 
     system_prompt = f"""
-    Ти — команда експертів: SalesGuru, ObjectionsPsychologist, MarketingHacker.
-    Урахуй, що наш клієнт — мама 28-45 років, шукає безпечний і комфортний тур 
-    до зоопарку Ньїредьгаза для дитини.
-    Ми використовуємо м'який тон, робимо акценти на сімейному відпочинку, безпеці та радості для дітей.
-    Застосовуй FOMO (обмеження місць), соціальні докази, якір цін.
+    Ти — менеджер з продажів турів до зоопарку Ньїредьгаза. 
+    Відповідай без привітань ("Доброго дня" тощо). 
+    Не згадуй про бота чи штучний інтелект. 
     Етап діалогу: {stage}.
     Повідомлення від клієнта: {user_text}.
     {empathy}
-    Відповідай українською, як реальний менеджер-людина, без згадок про бота.
-    Коротко та по суті.
     """
+
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_text}
@@ -182,7 +194,7 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
         response = await openai.ChatCompletion.acreate(
             model="gpt-3.5-turbo",
             messages=messages,
-            max_tokens=800,
+            max_tokens=500,
             temperature=0.7
         )
         advice_text = response["choices"][0]["message"]["content"]
@@ -202,7 +214,6 @@ def adaptive_typing_delay(text: str, sentiment: str) -> float:
         delay = 2.0 + base_factor * 0.6
     else:
         delay = 1.5 + base_factor * 0.5
-
     delay = max(1, min(10, delay))
     return delay
 
@@ -256,10 +267,8 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
     conn.close()
 
 #
-# --- FOLLOW-UP LOGIC (PREDICTIVE MESSAGES) ---
+# --- FOLLOW-UP (PREDICTIVE MESSAGES) ---
 #
-FOLLOWUP_DELAY_SECONDS = 120
-
 def followup_callback(context: ContextTypes.DEFAULT_TYPE):
     job_data = context.job.data
     chat_id = context.job.chat_id
@@ -328,6 +337,9 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
+
+    # log
+    logger.info("Intro handler: user_text=%s", user_text)
 
     if is_affirmative(user_text):
         response_text = "Чудово! Який тип туру вас цікавить? (Одноденний чи довгий)"
@@ -408,6 +420,10 @@ async def city_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return STAGE_TRAVELERS
 
 async def travelers_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Если человек едет один, пропускаем стадию child_age.
+    Иначе - спрашиваем "Сколько лет ребенку?"
+    """
     cancel_followup(context.user_data)
     user_id = str(update.effective_user.id)
     user_text = update.message.text
@@ -415,14 +431,30 @@ async def travelers_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
-    gpt_answer = await invoke_gpt("travelers", user_text, context.user_data)
-    response_text = gpt_answer + "\n\nСкільки років дитині?"
+    # Определяем, путешествует ли пользователь один
+    if user_travels_alone(user_text):
+        # Устанавливаем флаг "solo" в user_data
+        context.user_data["solo"] = True
+        context.user_data["travelers"] = "solo"
+        # Теперь переходим сразу к презентации
+        gpt_answer = await invoke_gpt("travelers_solo", user_text, context.user_data)
+        response_text = gpt_answer + "\n\nЧудово! У мене достатньо інформації, щоб запропонувати варіант туру. Можемо перейти до презентації?"
+        await typing_simulation(update, response_text, sentiment)
 
-    await typing_simulation(update, response_text, sentiment)
-    context.user_data["travelers"] = user_text
-    save_user_state(user_id, STAGE_CHILD_AGE, context.user_data)
-    schedule_followup(context, update.effective_chat.id, context.user_data)
-    return STAGE_CHILD_AGE
+        save_user_state(user_id, STAGE_PRESENTATION, context.user_data)
+        schedule_followup(context, update.effective_chat.id, context.user_data)
+        return STAGE_PRESENTATION
+    else:
+        # Иначе - идём по стандартному сценарию
+        gpt_answer = await invoke_gpt("travelers", user_text, context.user_data)
+        response_text = gpt_answer + "\n\nСкільки років дитині?"
+        await typing_simulation(update, response_text, sentiment)
+        
+        context.user_data["solo"] = False
+        context.user_data["travelers"] = user_text
+        save_user_state(user_id, STAGE_CHILD_AGE, context.user_data)
+        schedule_followup(context, update.effective_chat.id, context.user_data)
+        return STAGE_CHILD_AGE
 
 async def child_age_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_followup(context.user_data)
@@ -461,6 +493,7 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     sentiment = await analyze_sentiment(user_text)
     context.user_data["sentiment"] = sentiment
 
+    # Если "solo" в user_data и ещё нет contact_info (для длинного тура?)
     tour_type = context.user_data.get("tour_type", "")
     if "довг" in tour_type and "contact_info" not in context.user_data:
         context.user_data["contact_info"] = user_text
@@ -471,14 +504,22 @@ async def presentation_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     travelers = context.user_data.get("travelers", "")
     child_age = context.user_data.get("child_age", "")
 
-    script_text = (
-        f"Чудово! Отже, плануєте поїздку з {city}, "
-        f"група: {travelers}, вік дитини: {child_age} років. "
-        "Розумію, що для вас важлива зручність та безпека подорожі.\n\n"
-        "Можу розповісти про вартість і всі переваги туру. Цікаво?"
-    )
-    response_text = gpt_answer + "\n\n" + script_text
+    # Если едет один (solo = True), убираем упоминание о ребенке
+    if context.user_data.get("solo"):
+        script_text = (
+            f"Чудово! Отже, плануєте поїздку з {city} самостійно. "
+            "Розумію, що для вас важливі зручність та безпека подорожі.\n\n"
+            "Можу розповісти про вартість і переваги туру. Цікаво?"
+        )
+    else:
+        script_text = (
+            f"Чудово! Отже, плануєте поїздку з {city}, "
+            f"група: {travelers}, вік дитини: {child_age} років. "
+            "Розумію, що для вас важлива зручність та безпека подорожі.\n\n"
+            "Можу розповісти про вартість і всі переваги туру. Цікаво?"
+        )
 
+    response_text = gpt_answer + "\n\n" + script_text
     await typing_simulation(update, response_text, sentiment)
     context.user_data["presentation_step"] = 1
     save_user_state(user_id, STAGE_PRESENTATION, context.user_data)
@@ -498,7 +539,7 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
 
     response_text = gpt_answer
 
-    # Крок 1
+    # Кроки презентации
     if step == 1:
         if is_affirmative(user_text):
             tour_type = context.user_data.get("tour_type", "")
@@ -506,7 +547,6 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
                 price = "4500"
             else:
                 price = "2000"
-            
             response_text += (
                 f"\n\nВартість туру для вашої групи становить {price} грн "
                 "(включає проїзд, вхідні квитки та супровід). "
