@@ -42,7 +42,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
+WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://travel-bot-5u6d.onrender.com')
 
 openai.api_key = OPENAI_API_KEY
 
@@ -62,7 +62,7 @@ openai.api_key = OPENAI_API_KEY
 bot_loop = None
 
 # --- Настройка задержки для follow-up
-FOLLOWUP_DELAY_SECONDS = 120  # Через сколько секунд отправлять напоминание
+FOLLOWUP_DELAY_SECONDS = 120  # например, 2 минуты
 
 #
 # --- CHECK IF BOT IS ALREADY RUNNING ---
@@ -82,6 +82,29 @@ def is_bot_already_running():
 logger.info("Initializing VADER Sentiment Analyzer...")
 sentiment_analyzer = SentimentIntensityAnalyzer()
 logger.info("VADER Sentiment Analyzer initialized.")
+
+
+#
+# --- HELPER FUNCTIONS ---
+#
+def is_affirmative(user_text: str) -> bool:
+    user_text_lower = user_text.lower()
+    affirmatives = [
+        "так", "да", "ок", "окей", "хочу", "хотим", "продолжай", "продовжуй",
+        "yes", "yeah", "yep", "yah", "si", "sí", "oui", "ja", "давай",
+        "добре", "good", "ok", "sure", "можна", "можемо", "конечно", "ага",
+        "звичайно", "авжеж", "згоден", "згодна", "цікавить", "звісно"
+    ]
+    return any(word in user_text_lower for word in affirmatives)
+
+def is_negative(user_text: str) -> bool:
+    user_text_lower = user_text.lower()
+    negatives = [
+        "нет", "ні", "не хочу", "no", "nope", "не треба",
+        "не надо", "not now", "не готов", "не готова", "cancel",
+        "відміна", "скасувати", "пізніше", "не цікавить"
+    ]
+    return any(word in user_text_lower for word in negatives)
 
 async def analyze_sentiment(text: str) -> str:
     """Определяем общий тон (позитив, негатив, нейтрал)."""
@@ -105,10 +128,7 @@ def detect_fear_keywords(text: str) -> bool:
     return any(keyword in text_lower for keyword in fear_related)
 
 def detect_price_keywords(text: str) -> bool:
-    """
-    Проверяем упоминания о завышенной цене:
-    'дорого', 'висока ціна', 'слишком дорого', 'too expensive' и т.д.
-    """
+    """Проверяем упоминания о завышенной цене."""
     price_related = [
         "дорого", "висока ціна", "too expensive", 
         "costly", "завелика ціна", "слишком дорого"
@@ -120,7 +140,6 @@ def detect_price_keywords(text: str) -> bool:
 # --- GPT INTERACTION ---
 #
 async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
-    """Вызов GPT для гибкого ответа."""
     sentiment = context_data.get("sentiment", "нейтральний")
 
     if sentiment == "негативний":
@@ -176,12 +195,6 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
 # --- TYPING LOGIC ---
 #
 def adaptive_typing_delay(text: str, sentiment: str) -> float:
-    """
-    Рассчитываем задержку, зависящую от длины текста и тональности:
-      - 'негативний': бот отвечает быстрее
-      - 'позитивний': бот медленнее
-      - 'нейтральний': средняя скорость
-    """
     base_factor = len(text) / 50  
     if sentiment == "негативний":
         delay = 1.0 + base_factor * 0.4
@@ -194,7 +207,6 @@ def adaptive_typing_delay(text: str, sentiment: str) -> float:
     return delay
 
 async def typing_simulation(update: Update, text: str, sentiment: str = "нейтральний"):
-    """Имитируем typing c адаптивной задержкой и отправляем сообщение."""
     await update.effective_chat.send_action(ChatAction.TYPING)
     delay = adaptive_typing_delay(text, sentiment)
     await asyncio.sleep(delay)
@@ -228,7 +240,7 @@ def load_user_state(user_id: str):
     row = c.fetchone()
     conn.close()
     if row:
-        return row[0], row[1]  # (stage, user_data_json)
+        return row[0], row[1]
     return None, None
 
 def save_user_state(user_id: str, current_stage: int, user_data: dict):
@@ -246,25 +258,20 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 #
 # --- FOLLOW-UP LOGIC (PREDICTIVE MESSAGES) ---
 #
+FOLLOWUP_DELAY_SECONDS = 120
+
 def followup_callback(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляем follow-up сообщение, если пользователь долго молчит."""
     job_data = context.job.data
     chat_id = context.job.chat_id
     message = job_data.get("message", "Нагадую, що знижка діє до кінця тижня! Якщо виникли питання — пишіть!")
     context.bot.send_message(chat_id=chat_id, text=message)
 
 def schedule_followup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_data: dict):
-    """
-    Планируем через FOLLOWUP_DELAY_SECONDS отправить follow-up.
-    Если уже был job в user_data["followup_job"], отменяем его.
-    """
     job_queue = context.job_queue
-    # Сначала отменяем старую задачу
     old_job = user_data.get("followup_job")
     if old_job:
         old_job.schedule_removal()
 
-    # Создаём новую задачу
     job = job_queue.run_once(
         followup_callback,
         FOLLOWUP_DELAY_SECONDS,
@@ -274,7 +281,6 @@ def schedule_followup(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_dat
     user_data["followup_job"] = job
 
 def cancel_followup(user_data: dict):
-    """Отменяем существующий follow-up, если есть."""
     old_job = user_data.get("followup_job")
     if old_job:
         old_job.schedule_removal()
@@ -283,14 +289,12 @@ def cancel_followup(user_data: dict):
 #
 # --- FLASK APP & BOT HANDLERS ---
 #
-
 app = Flask(__name__)
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     init_db()
 
-    # Отменяем старый followup если был:
     cancel_followup(context.user_data)
 
     saved_stage, saved_user_data_json = load_user_state(user_id)
@@ -318,7 +322,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return STAGE_INTRO
 
 async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    cancel_followup(context.user_data)  # отменяем старый followup
+    cancel_followup(context.user_data)
     user_id = str(update.effective_user.id)
     user_text = update.message.text
 
@@ -331,7 +335,6 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user_state(user_id, STAGE_NEEDS, context.user_data)
         schedule_followup(context, update.effective_chat.id, context.user_data)
         return STAGE_NEEDS
-
     elif is_negative(user_text):
         response_text = (
             "Зрозуміло. Якщо передумаєте — пишіть. "
@@ -341,7 +344,6 @@ async def intro_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
         schedule_followup(context, update.effective_chat.id, context.user_data)
         return STAGE_ADDITIONAL_QUESTIONS
-
     else:
         if user_text.lower().startswith("продовжити"):
             saved_stage, saved_user_data_json = load_user_state(user_id)
@@ -794,9 +796,6 @@ async def run_bot():
     )
 
     application.add_handler(conv_handler)
-
-    # ВАЖНО: JobQueue автоматически создаётся внутри application (v20+).
-    # Мы можем использовать application.job_queue для run_once, run_repeating, и т.д.
 
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
