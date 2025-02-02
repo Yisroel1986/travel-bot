@@ -59,6 +59,9 @@ openai.api_key = OPENAI_API_KEY
     STAGE_FINISH
 ) = range(10)
 
+# Новый этап для сбора обратной связи (оценки ответа)
+FEEDBACK_RATING = 100
+
 bot_loop = None
 
 # --- FOLLOWUP DELAY
@@ -113,7 +116,7 @@ def user_travels_alone(user_text: str) -> bool:
     Простейшая проверка, чтобы понять, что человек путешествует один:
     ловим фразы вроде 'только я', 'один', 'сам', 'лишь я', etc.
     """
-    solo_keywords = ["только", "сам", "один", "лишь я", "лишь я", "solo"]
+    solo_keywords = ["только", "сам", "один", "лишь я", "solo"]
     text_lower = user_text.lower()
     return any(keyword in text_lower for keyword in solo_keywords)
 
@@ -176,6 +179,14 @@ async def invoke_gpt(stage: str, user_text: str, context_data: dict) -> str:
     # Если жалобы на цену
     if detect_price_keywords(user_text):
         empathy += " Клієнт вважає, що ціна зависока. Поясни вигоду і якірну ціну."
+
+    # Интеграция обратной связи: корректировка в зависимости от середнього балла
+    feedback_score = context_data.get("feedback_score")
+    if feedback_score is not None:
+        if feedback_score < 3:
+            empathy += " Обратите внимание: отримані низькі оцінки свідчать, що відповіді можуть бути недостатньо зрозумілими. Постарайтесь бути більш детальними та ясними."
+        elif feedback_score >= 4.5:
+            empathy += " Користувач високо оцінює відповіді, продовжуйте у тому ж дусі."
 
     system_prompt = f"""
     Ти — менеджер з продажів турів до зоопарку Ньїредьгаза. 
@@ -241,6 +252,17 @@ def init_db():
             last_interaction TIMESTAMP
         )
     """)
+    # Новая таблица для збереження зворотного зв'язку від користувачів
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS user_feedback (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id TEXT,
+            stage INTEGER,
+            rating INTEGER,
+            comment TEXT,
+            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -265,6 +287,26 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
     """, (user_id, current_stage, user_data_json, now))
     conn.commit()
     conn.close()
+
+def save_user_feedback(user_id: str, stage: int, rating: int, comment: str = ""):
+    conn = sqlite3.connect("bot_database.db")
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO user_feedback (user_id, stage, rating, comment)
+        VALUES (?, ?, ?, ?)
+    """, (user_id, stage, rating, comment))
+    conn.commit()
+    conn.close()
+
+def get_user_feedback_average(user_id: str):
+    conn = sqlite3.connect("bot_database.db")
+    c = conn.cursor()
+    c.execute("""
+        SELECT AVG(rating) FROM user_feedback WHERE user_id = ?
+    """, (user_id,))
+    avg_rating = c.fetchone()[0]
+    conn.close()
+    return avg_rating
 
 #
 # --- FOLLOW-UP (PREDICTIVE MESSAGES) ---
@@ -539,7 +581,7 @@ async def presentation_steps_handler(update: Update, context: ContextTypes.DEFAU
 
     response_text = gpt_answer
 
-    # Кроки презентации
+    # Кроки презентації
     if step == 1:
         if is_affirmative(user_text):
             tour_type = context.user_data.get("tour_type", "")
@@ -759,7 +801,34 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return STAGE_ADDITIONAL_QUESTIONS
 
 #
-# --- WEBHOOK & BOT LAUNCH ---
+# --- ОБРАТНЯ ЗВОРОТНА СВЯЗЬ (FEEDBACK RATING) ---
+#
+async def rate_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Пожалуйста, оцените последний ответ от 1 до 5 (де 5 – відмінно, а 1 – незадовільно):")
+    return FEEDBACK_RATING
+
+async def rate_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    try:
+        rating = int(update.message.text)
+        if rating < 1 or rating > 5:
+            raise ValueError("Неверный диапазон")
+    except ValueError:
+        await update.message.reply_text("Будь ласка, введіть число від 1 до 5.")
+        return FEEDBACK_RATING
+
+    # Збереження зворотного зв'язку в БД
+    current_stage = context.user_data.get("current_stage", -1)
+    save_user_feedback(user_id, current_stage, rating)
+    # Оновлення середнього балу у даних користувача
+    avg_rating = get_user_feedback_average(user_id)
+    context.user_data["feedback_score"] = avg_rating
+
+    await update.message.reply_text(f"Дякую за вашу оцінку! Ваш середній бал зараз: {avg_rating:.2f}.")
+    return ConversationHandler.END
+
+#
+# --- FLASK APP & BOT LAUNCH ---
 #
 @app.route('/')
 def index():
@@ -835,7 +904,18 @@ async def run_bot():
         fallbacks=[CommandHandler('cancel', cancel)]
     )
 
+    # ConversationHandler для збору оцінки (feedback rating)
+    from telegram.ext import ConversationHandler as RateConversationHandler
+    rate_conv_handler = RateConversationHandler(
+        entry_points=[CommandHandler('rate', rate_start)],
+        states={
+            FEEDBACK_RATING: [MessageHandler(filters.TEXT & ~filters.COMMAND, rate_receive)]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+
     application.add_handler(conv_handler)
+    application.add_handler(rate_conv_handler)
 
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
