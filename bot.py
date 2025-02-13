@@ -22,6 +22,7 @@ from datetime import datetime
 from flask import Flask, request
 import asyncio
 import threading
+import re
 
 # Попытка импорта spaCy и загрузка украинской модели
 try:
@@ -70,7 +71,7 @@ def is_bot_already_running():
     STAGE_END                   # 11. Завершення
 ) = range(12)
 
-NO_RESPONSE_DELAY_SECONDS = 6 * 3600  # 6 годин
+NO_RESPONSE_DELAY_SECONDS = 6 * 3600  # 6 часов
 
 # --- FLASK APP ---
 app = Flask(__name__)
@@ -180,8 +181,8 @@ def is_negative_response(text: str) -> bool:
 
 def analyze_intent(text: str) -> str:
     """
-    Анализ намерения с использованием spaCy (если доступен).
-    Если spaCy не загружен, выполняется базовая проверка по ключевым словам.
+    Анализ намерения с использованием spaCy (если доступно).
+    Если spaCy не загружен, выполняется базовый анализ по ключевым словам.
     """
     if nlp_uk:
         doc = nlp_uk(text)
@@ -343,7 +344,8 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     choice_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    if "деталь" in choice_text:
+    # Добавлена проверка на "деталі"
+    if "деталь" in choice_text or "деталі" in choice_text:
         context.user_data["choice"] = "details"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         return await details_handler(update, context)
@@ -533,7 +535,7 @@ async def payment_confirm_handler(update: Update, context: ContextTypes.DEFAULT_
     save_user_state(user_id, STAGE_END, context.user_data)
     return STAGE_END
 
-# Команда /cancel для завершення диалога.
+# Команда /cancel для завершения диалога.
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user = update.message.from_user
