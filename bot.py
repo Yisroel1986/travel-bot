@@ -217,7 +217,7 @@ async def get_chatgpt_response(prompt: str) -> str:
     try:
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-3.5-turbo",
+            model="gpt-3.5-turbo",  # можно изменить на "gpt-4" при наличии доступа
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150
         )
@@ -309,8 +309,7 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return STAGE_DETAILS
 
     # Фолбек для неясных ответов – вызываем ChatGPT для генерации ответа
-    fallback_prompt = ("В рамках сценария тура, клиент написал: " + user_text +
-                       "\nОтветьте вежливо и понятно, соблюдая сценарий.")
+    fallback_prompt = "В рамках сценария тура, клиент написал: " + user_text + "\nОтветьте вежливо и понятно, соблюдая сценарий."
     fallback_text = await get_chatgpt_response(fallback_prompt)
     await typing_simulation(update, fallback_text)
     return STAGE_GREET
@@ -366,7 +365,6 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     choice_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    # Добавлена проверка на "деталь" или "деталі"
     if "деталь" in choice_text or "деталі" in choice_text:
         context.user_data["choice"] = "details"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
@@ -431,6 +429,18 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
+    
+    # Если в ответе обнаружены фразы, указывающие на готовность бронировать тур
+    booking_keywords = ["бронювати", "купувати тур", "давай бронювати", "окей давай бронювати"]
+    if any(kw in user_text for kw in booking_keywords):
+        # Переход к этапу закрытия сделки
+        response_text = (
+            "Добре, переходимо до оформлення бронювання. "
+            "Я надам вам реквізити для оплати."
+        )
+        await typing_simulation(update, response_text)
+        save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
+        return await close_deal_handler(update, context)
     
     no_more_questions = ["немає", "все зрозуміло", "все ок", "досить", "спасибі", "дякую"]
     if any(k in user_text for k in no_more_questions):
