@@ -41,6 +41,15 @@ except Exception as e:
     openai = None
     logging.warning("OpenAI library not available. ChatGPT fallback disabled.")
 
+# Попытка импорта Transformers для анализа тональности
+try:
+    from transformers import pipeline
+    sentiment_pipeline = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
+    logging.info("Transformers sentiment analysis pipeline loaded successfully.")
+except Exception as e:
+    sentiment_pipeline = None
+    logging.warning("Transformers sentiment analysis pipeline not available.")
+
 # --- LOGGING AND SETTINGS ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -130,7 +139,7 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 def no_response_callback(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     message = (
-        "Я можу коротко розповісти про наш одноденний тур до зоопарку Ньїредьгази, Угорщина. "
+        "Я можу коротко розповісти про наш одноденний тур до зоопарку Ньїредьгаза, Угорщина. "
         "Це шанс подарувати вашій дитині незабутній день серед екзотичних тварин і водночас нарешті відпочити вам. 🦁🐧\n\n"
         "Комфортний автобус, насичена програма і мінімум турбот для вас – все організовано. "
         "Діти отримають море вражень, а ви зможете просто насолоджуватись разом з ними. 🎉\n"
@@ -173,7 +182,7 @@ def mention_user(update: Update) -> str:
     user = update.effective_user
     return user.first_name if user and user.first_name else "друже"
 
-# Базовий аналіз відповіді по ключовим словам
+# Базовий аналіз відповіді за ключовими словами
 def is_positive_response(text: str) -> bool:
     positive_keywords = [
         "так", "добре", "да", "ок", "продовжуємо", "розкажіть", "готовий", "готова",
@@ -210,7 +219,25 @@ def analyze_intent(text: str) -> str:
         else:
             return "unclear"
 
-# Функція для генерації відповіді за допомогою ChatGPT
+# Функція для аналізу тональності за допомогою Transformers
+def get_sentiment(text: str) -> str:
+    if sentiment_pipeline:
+        result = sentiment_pipeline(text)[0]
+        try:
+            stars = int(result["label"].split()[0])
+            if stars <= 2:
+                return "negative"
+            elif stars == 3:
+                return "neutral"
+            else:
+                return "positive"
+        except Exception as e:
+            logging.error("Error parsing sentiment result: %s", e)
+            return "neutral"
+    else:
+        return "negative" if is_negative_response(text) else "neutral"
+
+# Функція для генерації відповіді з допомогою ChatGPT
 async def get_chatgpt_response(prompt: str) -> str:
     if openai is None:
         return "Вибачте, функція ChatGPT недоступна."
@@ -261,7 +288,6 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
     cancel_no_response_job(context)
 
-    # Обробка команд "продовжити" та "почати заново"
     if "продовжити" in user_text.lower():
         saved_stage, saved_data_json = load_user_state(user_id)
         if saved_stage is not None:
@@ -288,7 +314,6 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_GREET
 
-    # Аналіз наміру з використанням spaCy або базовий аналіз
     intent = analyze_intent(user_text)
     if intent == "positive":
         response_text = (
@@ -308,7 +333,6 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DETAILS
 
-    # Фолбек: виклик ChatGPT із інструкцією відповідати українською
     fallback_prompt = (
         "В рамках сценарію тура, клієнт написав: " + user_text +
         "\nВідповідай українською мовою, дотримуючись сценарію тура."
@@ -433,7 +457,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
     
-    # Якщо в відповіді містяться ключові фрази для бронювання
     booking_keywords = ["бронювати", "бронюй", "купувати тур", "давай бронювати", "окей давай бронювати", "окей бронюй тур"]
     if any(kw in user_text for kw in booking_keywords):
         response_text = (
@@ -450,32 +473,32 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_IMPRESSION, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_IMPRESSION
-    elif "дитина" in user_text and "злякається" in user_text:
-        answer_text = (
-            "Розумію ваші хвилювання. Ми організовуємо екскурсію так, щоб діти почувалися комфортно: "
-            "є дитячі майданчики, зони відпочинку та шоу морських котиків, яке дуже подобається дітям. 😊"
+    
+    sentiment = get_sentiment(user_text)
+    if sentiment == "negative":
+        fallback_prompt = (
+            "Клієнт висловив негативне ставлення: " + user_text +
+            "\nВідповідай українською мовою, проявляючи емпатію, вибачся та запропонуй допомогу."
         )
+        fallback_text = await get_chatgpt_response(fallback_prompt)
+        await typing_simulation(update, fallback_text)
+        return STAGE_ADDITIONAL_QUESTIONS
+
+    intent = analyze_intent(user_text)
+    if intent == "unclear":
+        fallback_prompt = (
+            "В рамках сценарію тура, клієнт задав нестандартне запитання: " + user_text +
+            "\nВідповідай українською мовою, дотримуючись сценарію та проявляючи розуміння."
+        )
+        fallback_text = await get_chatgpt_response(fallback_prompt)
+        await typing_simulation(update, fallback_text)
+        return STAGE_ADDITIONAL_QUESTIONS
+    else:
+        answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
         await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
         save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
-    else:
-        # Фолбек: якщо намір неясний – виклик ChatGPT з проханням відповісти українською
-        intent = analyze_intent(user_text)
-        if intent == "unclear":
-            fallback_prompt = (
-                "В рамках сценарію тура, клієнт задал нестандартне запитання: " + user_text +
-                "\nВідповідай українською мовою, дотримуючись сценарію."
-            )
-            fallback_text = await get_chatgpt_response(fallback_prompt)
-            await typing_simulation(update, fallback_text)
-            return STAGE_ADDITIONAL_QUESTIONS
-        else:
-            answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
-            await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
-            save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
-            schedule_no_response_job(context, update.effective_chat.id)
-            return STAGE_ADDITIONAL_QUESTIONS
 
 # ЕТАП 7: Запит загального враження.
 async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):

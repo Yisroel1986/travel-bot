@@ -45,3 +45,4 @@ yarl==1.18.3
 vaderSentiment==3.3.2
 deep-translator==1.8.1
 spacy==3.8.4
+transformers==4.31.0
