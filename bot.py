@@ -373,7 +373,7 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["choice"] = "cost"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         return await details_handler(update, context)
-    elif "брон" in choice_text:
+    elif "брон" in choice_text or "бронюй" in choice_text:
         context.user_data["choice"] = "booking"
         response_text = (
             "Я дуже рада, що Ви обрали подорож з нами, це буде дійсно крута поїздка. "
@@ -430,10 +430,9 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
     
-    # Если в ответе обнаружены фразы, указывающие на готовность бронировать тур
-    booking_keywords = ["бронювати", "купувати тур", "давай бронювати", "окей давай бронювати"]
+    # Если в ответе обнаружены ключевые фразы, указывающие на бронирование
+    booking_keywords = ["бронювати", "бронюй", "купувати тур", "давай бронювати", "окей давай бронювати", "окей бронюй тур"]
     if any(kw in user_text for kw in booking_keywords):
-        # Переход к этапу закрытия сделки
         response_text = (
             "Добре, переходимо до оформлення бронювання. "
             "Я надам вам реквізити для оплати."
@@ -442,6 +441,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         return await close_deal_handler(update, context)
     
+    # Если пользователь сообщает, что вопросов больше нет
     no_more_questions = ["немає", "все зрозуміло", "все ок", "досить", "спасибі", "дякую"]
     if any(k in user_text for k in no_more_questions):
         response_text = "Як вам наша пропозиція в цілому? 🌟"
@@ -459,11 +459,20 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
     else:
-        answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
-        await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
-        save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
-        schedule_no_response_job(context, update.effective_chat.id)
-        return STAGE_ADDITIONAL_QUESTIONS
+        # Если намерение неясно, вызываем ChatGPT fallback
+        intent = analyze_intent(user_text)
+        if intent == "unclear":
+            fallback_prompt = "Клиент задал нестандартный вопрос: " + user_text + "\nОтветьте, как можно лучше, с учетом сценария тура."
+            fallback_text = await get_chatgpt_response(fallback_prompt)
+            await typing_simulation(update, fallback_text)
+            # После fallback остаемся на этом же этапе, чтобы продолжить диалог
+            return STAGE_ADDITIONAL_QUESTIONS
+        else:
+            answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
+            await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
+            save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
+            schedule_no_response_job(context, update.effective_chat.id)
+            return STAGE_ADDITIONAL_QUESTIONS
 
 # ЭТАП 7: Запрос общего впечатления.
 async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
