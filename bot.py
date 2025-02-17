@@ -33,6 +33,14 @@ except Exception as e:
     nlp_uk = None
     logging.warning("spaCy or Ukrainian model not available. Falling back to basic keyword analysis.")
 
+# Попытка импорта OpenAI и настройка API-ключа
+try:
+    import openai
+    openai.api_key = os.getenv("OPENAI_API_KEY")
+except Exception as e:
+    openai = None
+    logging.warning("OpenAI library not available. ChatGPT fallback disabled.")
+
 # --- LOGGING AND SETTINGS ---
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -181,7 +189,7 @@ def is_negative_response(text: str) -> bool:
 
 def analyze_intent(text: str) -> str:
     """
-    Анализ намерения с использованием spaCy (если доступно).
+    Анализ намерения с использованием spaCy (если доступен).
     Если spaCy не загружен, выполняется базовый анализ по ключевым словам.
     """
     if nlp_uk:
@@ -201,6 +209,22 @@ def analyze_intent(text: str) -> str:
             return "negative"
         else:
             return "unclear"
+
+# Функция для генерации ответа с помощью ChatGPT
+async def get_chatgpt_response(prompt: str) -> str:
+    if openai is None:
+        return "Извините, функция ChatGPT недоступна."
+    try:
+        response = await asyncio.to_thread(
+            openai.ChatCompletion.create,
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=150
+        )
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error("Error calling ChatGPT: %s", e)
+        return "Извините, возникла ошибка при генерации ответа."
 
 #
 # --- BOT HANDLERS ---
@@ -284,13 +308,11 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DETAILS
 
-    # Фолбек для неясных ответов
-    text = (
-        "Вибачте, я не зрозуміла вашу відповідь. Будь ласка, скажіть, чи можемо продовжити?"
-    )
-    await typing_simulation(update, text)
-    save_user_state(user_id, STAGE_GREET, context.user_data)
-    schedule_no_response_job(context, update.effective_chat.id)
+    # Фолбек для неясных ответов – вызываем ChatGPT для генерации ответа
+    fallback_prompt = ("В рамках сценария тура, клиент написал: " + user_text +
+                       "\nОтветьте вежливо и понятно, соблюдая сценарий.")
+    fallback_text = await get_chatgpt_response(fallback_prompt)
+    await typing_simulation(update, fallback_text)
     return STAGE_GREET
 
 # ЭТАП 2: Запрос города отправления.
@@ -344,7 +366,7 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     choice_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    # Добавлена проверка на "деталі"
+    # Добавлена проверка на "деталь" или "деталі"
     if "деталь" in choice_text or "деталі" in choice_text:
         context.user_data["choice"] = "details"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
