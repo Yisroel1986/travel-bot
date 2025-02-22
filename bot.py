@@ -174,6 +174,7 @@ def cancel_no_response_job(context: CallbackContext):
 # --- HELPER FUNCTIONS ---
 #
 async def typing_simulation(update: Update, text: str):
+    """Отправляет эффект 'набираю сообщение', а затем выводит текст."""
     await update.effective_chat.send_action(ChatAction.TYPING)
     await asyncio.sleep(min(2, max(1, len(text)/80)))
     await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
@@ -182,7 +183,6 @@ def mention_user(update: Update) -> str:
     user = update.effective_user
     return user.first_name if user and user.first_name else "друже"
 
-# Базовий аналіз відповіді за ключовими словами
 def is_positive_response(text: str) -> bool:
     positive_keywords = [
         "так", "добре", "да", "ок", "продовжуємо", "розкажіть", "готовий", "готова",
@@ -197,10 +197,7 @@ def is_negative_response(text: str) -> bool:
     return any(keyword in text_lower for keyword in negative_keywords)
 
 def analyze_intent(text: str) -> str:
-    """
-    Аналіз наміру з використанням spaCy (якщо доступно).
-    Якщо spaCy не завантажено, використовується базовий аналіз за ключовими словами.
-    """
+    """Пытается определить, положительный ли ответ, отрицательный или непонятный."""
     if nlp_uk:
         doc = nlp_uk(text)
         lemmas = [token.lemma_.lower() for token in doc]
@@ -219,8 +216,8 @@ def analyze_intent(text: str) -> str:
         else:
             return "unclear"
 
-# Функція для аналізу тональності за допомогою Transformers
 def get_sentiment(text: str) -> str:
+    """Анализ тональности с помощью Transformers."""
     if sentiment_pipeline:
         result = sentiment_pipeline(text)[0]
         try:
@@ -235,16 +232,17 @@ def get_sentiment(text: str) -> str:
             logging.error("Error parsing sentiment result: %s", e)
             return "neutral"
     else:
+        # fallback
         return "negative" if is_negative_response(text) else "neutral"
 
-# Функція для генерації відповіді з допомогою ChatGPT
 async def get_chatgpt_response(prompt: str) -> str:
+    """Вызов ChatGPT для fallback-ответов."""
     if openai is None:
         return "Вибачте, функція ChatGPT недоступна."
     try:
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-3.5-turbo",  # можна змінити на "gpt-4" при наявності доступу
+            model="gpt-3.5-turbo",  # можно заменить на gpt-4 при доступе
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150
         )
@@ -282,7 +280,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_GREET
 
-# ЕТАП 1: Обробка привітання.
 async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text.strip()
@@ -333,6 +330,7 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DETAILS
 
+    # Fallback: ChatGPT
     fallback_prompt = (
         "В рамках сценарію тура, клієнт написав: " + user_text +
         "\nВідповідай українською мовою, дотримуючись сценарію тура."
@@ -341,7 +339,6 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await typing_simulation(update, fallback_text)
     return STAGE_GREET
 
-# ЕТАП 2: Запит міста відправлення.
 async def departure_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     departure = update.message.text.strip()
@@ -354,7 +351,6 @@ async def departure_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_TRAVEL_PARTY
 
-# ЕТАП 3: Запит про склад групи.
 async def travel_party_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     party_info = update.message.text.lower().strip()
@@ -374,7 +370,6 @@ async def travel_party_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CHOICE
 
-# ЕТАП 3.1: Якщо згадується дитина – запитуємо її вік.
 async def child_age_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     child_age = update.message.text.strip()
@@ -387,7 +382,6 @@ async def child_age_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_CHOICE
 
-# ЕТАП 4: Вибір напрямку.
 async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     choice_text = update.message.text.lower().strip()
@@ -419,7 +413,6 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CHOICE
 
-# ЕТАП 5: Надання деталей туру.
 async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     cancel_no_response_job(context)
@@ -451,12 +444,27 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_chat.send_message(text=response_followup)
     return STAGE_ADDITIONAL_QUESTIONS
 
-# ЕТАП 6: Обробка додаткових запитань.
 async def additional_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
     
+    # 1. Если вопрос о времени выезда
+    time_keywords = ["коли виїзд", "коли відправлення", "час виїзду", "коли автобус", "коли вирушаємо"]
+    if any(k in user_text for k in time_keywords):
+        # Здесь можно настроить свой ответ
+        # Допустим, выезд 26 октября в 6:00 из Ужгорода и 6:30 из Мукачева
+        answer_text = (
+            "Ми вирушаємо 26 жовтня о 6:00 з Ужгорода і о 6:30 з Мукачева. "
+            "Повертаємось увечері, орієнтовно о 20:00. "
+            "Чи є ще запитання? 😊"
+        )
+        await typing_simulation(update, answer_text)
+        save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_ADDITIONAL_QUESTIONS
+    
+    # 2. Ключевые слова для бронирования
     booking_keywords = ["бронювати", "бронюй", "купувати тур", "давай бронювати", "окей давай бронювати", "окей бронюй тур"]
     if any(kw in user_text for kw in booking_keywords):
         response_text = (
@@ -466,6 +474,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         return await close_deal_handler(update, context)
     
+    # 3. Ключевые слова, что вопросов нет
     no_more_questions = ["немає", "все зрозуміло", "все ок", "досить", "спасибі", "дякую"]
     if any(k in user_text for k in no_more_questions):
         response_text = "Як вам наша пропозиція в цілому? 🌟"
@@ -474,6 +483,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_IMPRESSION
     
+    # 4. Анализ тональности (на случай негативного сообщения)
     sentiment = get_sentiment(user_text)
     if sentiment == "negative":
         fallback_prompt = (
@@ -484,6 +494,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         await typing_simulation(update, fallback_text)
         return STAGE_ADDITIONAL_QUESTIONS
 
+    # 5. Если намерение неясно - ChatGPT fallback
     intent = analyze_intent(user_text)
     if intent == "unclear":
         fallback_prompt = (
@@ -493,14 +504,14 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         fallback_text = await get_chatgpt_response(fallback_prompt)
         await typing_simulation(update, fallback_text)
         return STAGE_ADDITIONAL_QUESTIONS
-    else:
-        answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
-        await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
-        save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
-        schedule_no_response_job(context, update.effective_chat.id)
-        return STAGE_ADDITIONAL_QUESTIONS
+    
+    # 6. Иначе - шаблонный ответ
+    answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
+    await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
+    save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
+    schedule_no_response_job(context, update.effective_chat.id)
+    return STAGE_ADDITIONAL_QUESTIONS
 
-# ЕТАП 7: Запит загального враження.
 async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
@@ -533,7 +544,6 @@ async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CLOSE_DEAL
 
-# ЕТАП 8: Закриття угоди (бронь).
 async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
@@ -566,7 +576,6 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_CLOSE_DEAL
 
-# ЕТАП 9: Обробка оплати.
 async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
@@ -589,7 +598,6 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_PAYMENT
 
-# ЕТАП 10: Підтвердження оплати.
 async def payment_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     cancel_no_response_job(context)
@@ -602,7 +610,6 @@ async def payment_confirm_handler(update: Update, context: ContextTypes.DEFAULT_
     save_user_state(user_id, STAGE_END, context.user_data)
     return STAGE_END
 
-# Команда /cancel для завершення діалогу.
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user = update.message.from_user
@@ -613,9 +620,6 @@ async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_user_state(user_id, STAGE_END, context.user_data)
     return ConversationHandler.END
 
-#
-# --- WEBHOOK & BOT LAUNCH ---
-#
 @app.route('/')
 def index():
     return "Сервер працює! Бот активний."
