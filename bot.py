@@ -23,7 +23,7 @@ from flask import Flask, request
 import asyncio
 import threading
 import re
-import requests  # Для обращения к CRM
+import requests  # Для обращения к KeyCRM
 
 # Попытка импорта spaCy и загрузка украинской модели
 try:
@@ -62,9 +62,10 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CRM_API_KEY = os.getenv("CRM_API_KEY")
-CRM_API_URL = os.getenv("CRM_API_URL", "https://familyplace.keycrm.app/app/catalog/")
+CRM_API_URL = os.getenv("CRM_API_URL", "https://familyplace.keycrm.app/api/v1/products")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 
+# Настраиваем ключ OpenAI, если он есть
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
@@ -146,8 +147,8 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 #
 def fetch_crm_tours():
     """
-    Пример функции для получения списка туров из CRM.
-    Использует CRM_API_KEY и CRM_API_URL из .env.
+    Пример функции для получения списка «туров» (products) из KeyCRM:
+    GET /api/v1/products (по документации).
     """
     if not CRM_API_KEY or not CRM_API_URL:
         logger.warning("CRM_API_KEY or CRM_API_URL not found. Returning empty tours list.")
@@ -157,11 +158,28 @@ def fetch_crm_tours():
         "Authorization": f"Bearer {CRM_API_KEY}",
         "Accept": "application/json"
     }
+    params = {
+        "page": 1,
+        "limit": 10  # Можете менять по желанию
+    }
     try:
-        resp = requests.get(CRM_API_URL, headers=headers, timeout=10)
+        resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
         if resp.status_code == 200:
-            # Предположим, что CRM возвращает JSON со списком туров
-            return resp.json()
+            data = resp.json()
+            # По документации KeyCRM, если /api/v1/products:
+            # {
+            #   "status": true,
+            #   "data": {
+            #       "items": [...],
+            #       "total": 10,
+            #       "page": 1,
+            #       "limit": 10
+            #   }
+            # }
+            # Мы возьмём data["data"]["items"]
+            items = data.get("data", {}).get("items", [])
+            logger.info(f"Fetched {len(items)} products from CRM.")
+            return items
         else:
             logger.error(f"CRM request failed with status {resp.status_code}")
             return []
@@ -224,13 +242,11 @@ def is_positive_response(text: str) -> bool:
         "так", "добре", "да", "ок", "продовжуємо", "розкажіть", "готовий", "готова",
         "привіт", "hello", "расскажи", "зацікав", "зацікавлений"
     ]
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in positive_keywords)
+    return any(k in text.lower() for k in positive_keywords)
 
 def is_negative_response(text: str) -> bool:
     negative_keywords = ["не хочу", "не можу", "нет", "ні", "не буду", "не зараз"]
-    text_lower = text.lower()
-    return any(keyword in text_lower for keyword in negative_keywords)
+    return any(k in text.lower() for k in negative_keywords)
 
 def analyze_intent(text: str) -> str:
     """Пытается определить, положительный ли ответ, отрицательный или непонятный."""
@@ -421,6 +437,7 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     choice_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
+
     if "деталь" in choice_text or "деталі" in choice_text:
         context.user_data["choice"] = "details"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
@@ -453,17 +470,22 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
 
-    # Получаем актуальные туры из CRM
+    # 1) Получаем данные из KeyCRM
     tours = fetch_crm_tours()
     if not tours:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
     else:
         tours_info = "Актуальні тури з CRM:\n"
         for t in tours:
-            name = t.get("name", "Тур без назви")
-            date = t.get("date", "Дата не вказана")
-            tours_info += f" - {name}, дата: {date}\n"
+            # По документации /api/v1/products items[i] могут иметь поля:
+            # "id", "title", "price", "sku", и т.д.
+            product_id = t.get("id", "?")
+            title = t.get("title", "Тур без назви")
+            price = t.get("price", "0")
+            # При желании можно добавить другие поля
+            tours_info += f" - [ID {product_id}] {title}, ціна: {price}\n"
 
+    # 2) Базовая информация
     if choice == "cost":
         text = (
             "Дата виїзду: 26 жовтня з Ужгорода та Мукачева. 🌟\n"
