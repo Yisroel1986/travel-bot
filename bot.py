@@ -23,6 +23,7 @@ from flask import Flask, request
 import asyncio
 import threading
 import re
+import requests  # Для обращения к CRM
 
 # Попытка импорта spaCy и загрузка украинской модели
 try:
@@ -36,7 +37,6 @@ except Exception as e:
 # Попытка импорта OpenAI и настройка API-ключа
 try:
     import openai
-    openai.api_key = os.getenv("OPENAI_API_KEY")
 except Exception as e:
     openai = None
     logging.warning("OpenAI library not available. ChatGPT fallback disabled.")
@@ -60,35 +60,43 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+CRM_API_KEY = os.getenv("CRM_API_KEY")
+CRM_API_URL = os.getenv("CRM_API_URL", "https://familyplace.keycrm.app/app/catalog/")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
+
+if openai and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
 
 # Проверка, что другие процессы бота не запущены
 def is_bot_already_running():
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
-        if (process.info['name'] == current_process.name() and 
-            process.info['cmdline'] == current_process.cmdline() and 
-            process.info['pid'] != current_process.pid):
+        if (
+            process.info['name'] == current_process.name()
+            and process.info['cmdline'] == current_process.cmdline()
+            and process.info['pid'] != current_process.pid
+        ):
             return True
     return False
 
 # --- STATE DEFINITIONS ---
 (
-    STAGE_GREET,                # 0. Приветствие
-    STAGE_DEPARTURE,            # 1. "Звідки вам зручніше виїжджати: з Ужгорода чи Мукачева?"
-    STAGE_TRAVEL_PARTY,         # 2. "Для кого ви розглядаєте поїздку? Чи з дитиною?"
-    STAGE_CHILD_AGE,            # 3. "Скільки років вашій дитині?"
-    STAGE_CHOICE,               # 4. "Що вас цікавить: деталі, вартість чи бронювання?"
-    STAGE_DETAILS,              # 5. Деталі туру
-    STAGE_ADDITIONAL_QUESTIONS, # 6. Додаткові питання
-    STAGE_IMPRESSION,           # 7. Запит про загальне враження
-    STAGE_CLOSE_DEAL,           # 8. Закриття угоди (бронювання)
-    STAGE_PAYMENT,              # 9. Оплата
-    STAGE_PAYMENT_CONFIRM,      # 10. Підтвердження оплати
-    STAGE_END                   # 11. Завершення
+    STAGE_GREET,
+    STAGE_DEPARTURE,
+    STAGE_TRAVEL_PARTY,
+    STAGE_CHILD_AGE,
+    STAGE_CHOICE,
+    STAGE_DETAILS,
+    STAGE_ADDITIONAL_QUESTIONS,
+    STAGE_IMPRESSION,
+    STAGE_CLOSE_DEAL,
+    STAGE_PAYMENT,
+    STAGE_PAYMENT_CONFIRM,
+    STAGE_END
 ) = range(12)
 
-NO_RESPONSE_DELAY_SECONDS = 6 * 3600  # 6 годин
+NO_RESPONSE_DELAY_SECONDS = 6 * 3600  # 6 часов
 
 # --- FLASK APP ---
 app = Flask(__name__)
@@ -132,6 +140,34 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
     """, (user_id, current_stage, user_data_json, now))
     conn.commit()
     conn.close()
+
+#
+# --- CRM INTEGRATION ---
+#
+def fetch_crm_tours():
+    """
+    Пример функции для получения списка туров из CRM.
+    Использует CRM_API_KEY и CRM_API_URL из .env.
+    """
+    if not CRM_API_KEY or not CRM_API_URL:
+        logger.warning("CRM_API_KEY or CRM_API_URL not found. Returning empty tours list.")
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {CRM_API_KEY}",
+        "Accept": "application/json"
+    }
+    try:
+        resp = requests.get(CRM_API_URL, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            # Предположим, что CRM возвращает JSON со списком туров
+            return resp.json()
+        else:
+            logger.error(f"CRM request failed with status {resp.status_code}")
+            return []
+    except Exception as e:
+        logger.error(f"CRM request exception: {e}")
+        return []
 
 #
 # --- FOLLOW-UP LOGIC (NO RESPONSE) ---
@@ -229,20 +265,19 @@ def get_sentiment(text: str) -> str:
             else:
                 return "positive"
         except Exception as e:
-            logging.error("Error parsing sentiment result: %s", e)
+            logger.error("Error parsing sentiment result: %s", e)
             return "neutral"
     else:
-        # fallback
         return "negative" if is_negative_response(text) else "neutral"
 
 async def get_chatgpt_response(prompt: str) -> str:
     """Вызов ChatGPT для fallback-ответов."""
-    if openai is None:
+    if openai is None or not OPENAI_API_KEY:
         return "Вибачте, функція ChatGPT недоступна."
     try:
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-3.5-turbo",  # можно заменить на gpt-4 при доступе
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=150
         )
@@ -330,7 +365,7 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DETAILS
 
-    # Fallback: ChatGPT
+    # Fallback
     fallback_prompt = (
         "В рамках сценарію тура, клієнт написав: " + user_text +
         "\nВідповідай українською мовою, дотримуючись сценарію тура."
@@ -417,15 +452,27 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
+
+    # Получаем актуальные туры из CRM
+    tours = fetch_crm_tours()
+    if not tours:
+        tours_info = "Наразі немає актуальних турів у CRM або стався збій."
+    else:
+        tours_info = "Актуальні тури з CRM:\n"
+        for t in tours:
+            name = t.get("name", "Тур без назви")
+            date = t.get("date", "Дата не вказана")
+            tours_info += f" - {name}, дата: {date}\n"
+
     if choice == "cost":
         text = (
             "Дата виїзду: 26 жовтня з Ужгорода та Мукачева. 🌟\n"
-            "Це цілий день, наповнений пригодами, і вже ввечері ви будете вдома, сповнені приємних спогадів. "
-            "Уявіть, як ваша дитина в захваті від зустрічі з левами, слонами і жирафами, а ви зможете насолодитися спокійним часом.\n\n"
+            "Це цілий день, наповнений пригодами, і вже ввечері ви будете вдома, сповнені приємних спогадів.\n\n"
             "Вартість туру становить 1900 грн з особи. Це ціна, що включає трансфер, квитки до зоопарку, страхування та супровід. "
             "Ви платите один раз і більше не турбуєтеся про жодні організаційні моменти! 🏷️\n\n"
             "Подорож на комфортабельному автобусі із зарядками для гаджетів і клімат-контролем. 🚌\n"
-            "Наш супровід вирішує всі організаційні питання в дорозі, а діти отримають море позитивних емоцій! 🎉"
+            "Наш супровід вирішує всі організаційні питання в дорозі, а діти отримають море позитивних емоцій! 🎉\n\n"
+            f"{tours_info}"
         )
     else:
         text = (
@@ -433,10 +480,12 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Тривалість: Цілий день, ввечері Ви вже вдома.\n"
             "Транспорт: Комфортабельний автобус із клімат-контролем та зарядками. 🚌\n"
             "Зоопарк: Більше 500 видів тварин, шоу морських котиків, фото та багато вражень! 🦁\n"
-            "Харчування: За власний рахунок, але у нас передбачений час для обіду в затишному кафе. 🍽️\n"
-            "Додаткові розваги: Після відвідування зоопарку ми заїдемо до великого торгового центру, де можна відпочити, зробити покупки або випити кави. ☕\n"
-            "Вартість туру: 1900 грн з особи. У вартість входить трансфер, квитки до зоопарку, медичне страхування та супровід. 🏷️"
+            "Харчування: За власний рахунок, але у нас передбачений час для обіду. 🍽️\n"
+            "Додаткові розваги: Після відвідування зоопарку ми заїдемо до великого торгового центру.\n"
+            "Вартість туру: 1900 грн з особи. У вартість входить трансфер, квитки до зоопарку, медичне страхування та супровід. 🏷️\n\n"
+            f"{tours_info}"
         )
+
     await typing_simulation(update, text)
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
     schedule_no_response_job(context, update.effective_chat.id)
@@ -449,11 +498,8 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
     
-    # 1. Если вопрос о времени выезда
     time_keywords = ["коли виїзд", "коли відправлення", "час виїзду", "коли автобус", "коли вирушаємо"]
     if any(k in user_text for k in time_keywords):
-        # Здесь можно настроить свой ответ
-        # Допустим, выезд 26 октября в 6:00 из Ужгорода и 6:30 из Мукачева
         answer_text = (
             "Ми вирушаємо 26 жовтня о 6:00 з Ужгорода і о 6:30 з Мукачева. "
             "Повертаємось увечері, орієнтовно о 20:00. "
@@ -464,7 +510,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
     
-    # 2. Ключевые слова для бронирования
     booking_keywords = ["бронювати", "бронюй", "купувати тур", "давай бронювати", "окей давай бронювати", "окей бронюй тур"]
     if any(kw in user_text for kw in booking_keywords):
         response_text = (
@@ -474,7 +519,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         return await close_deal_handler(update, context)
     
-    # 3. Ключевые слова, что вопросов нет
     no_more_questions = ["немає", "все зрозуміло", "все ок", "досить", "спасибі", "дякую"]
     if any(k in user_text for k in no_more_questions):
         response_text = "Як вам наша пропозиція в цілому? 🌟"
@@ -483,7 +527,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_IMPRESSION
     
-    # 4. Анализ тональности (на случай негативного сообщения)
     sentiment = get_sentiment(user_text)
     if sentiment == "negative":
         fallback_prompt = (
@@ -494,7 +537,6 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         await typing_simulation(update, fallback_text)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    # 5. Если намерение неясно - ChatGPT fallback
     intent = analyze_intent(user_text)
     if intent == "unclear":
         fallback_prompt = (
@@ -504,8 +546,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         fallback_text = await get_chatgpt_response(fallback_prompt)
         await typing_simulation(update, fallback_text)
         return STAGE_ADDITIONAL_QUESTIONS
-    
-    # 6. Иначе - шаблонный ответ
+
     answer_text = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте."
     await typing_simulation(update, answer_text + "\n\nЧи є ще запитання?")
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
