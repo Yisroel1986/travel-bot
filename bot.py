@@ -65,7 +65,6 @@ CRM_API_KEY = os.getenv("CRM_API_KEY")
 CRM_API_URL = os.getenv("CRM_API_URL", "https://familyplace.keycrm.app/api/v1/products")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 
-# Настраиваем ключ OpenAI, если он есть
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
@@ -145,10 +144,12 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 #
 # --- CRM INTEGRATION ---
 #
-def fetch_crm_tours():
+
+def fetch_all_products():
     """
-    Пример функции для получения списка «туров» (products) из KeyCRM:
-    GET /api/v1/products (по документации).
+    Получаем *все* продукты (туры) из KeyCRM, перебирая страницы, пока не кончатся.
+    Для каждого запроса указываем limit=50 (максимум) и page=n.
+    Возвращаем общий список (list) словарей.
     """
     if not CRM_API_KEY or not CRM_API_URL:
         logger.warning("CRM_API_KEY or CRM_API_URL not found. Returning empty tours list.")
@@ -158,34 +159,81 @@ def fetch_crm_tours():
         "Authorization": f"Bearer {CRM_API_KEY}",
         "Accept": "application/json"
     }
-    params = {
-        "page": 1,
-        "limit": 10  # Можете менять по желанию
-    }
-    try:
-        resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            # По документации KeyCRM, если /api/v1/products:
-            # {
-            #   "status": true,
-            #   "data": {
-            #       "items": [...],
-            #       "total": 10,
-            #       "page": 1,
-            #       "limit": 10
-            #   }
-            # }
-            # Мы возьмём data["data"]["items"]
-            items = data.get("data", {}).get("items", [])
-            logger.info(f"Fetched {len(items)} products from CRM.")
-            return items
-        else:
-            logger.error(f"CRM request failed with status {resp.status_code}")
-            return []
-    except Exception as e:
-        logger.error(f"CRM request exception: {e}")
-        return []
+
+    all_items = []
+    page = 1
+    limit = 50  # максимум 50, согласно документации
+
+    while True:
+        params = {"page": page, "limit": limit}
+        try:
+            resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                # Ожидаем структуру:
+                # {
+                #   "total": 100,
+                #   "current_page": 1,
+                #   "per_page": 15,
+                #   "data": [...],
+                #   ...
+                # }
+                # или "data": {
+                #       "items": [...],
+                #       "page": 1,
+                #       ...
+                # }
+                # в зависимости от того, как KeyCRM формирует ответ.
+
+                # Смотрим, есть ли "data" (массив)
+                if isinstance(data, dict):
+                    # Есть вариант:
+                    # data["data"] = массив
+                    # Или data["data"]["items"] = массив
+                    # В документации: "data" — массив объектов
+                    # но иногда бывает "data": { "items": [...] }
+                    # Нужно проверить структуру. Предположим, что "data" — список продуктов
+                    # Но согласно doc: "data": [ {product}, ... ] (paged)
+                    # Либо "data": { "items": [...] } (тоже paged)
+                    if "data" in data and isinstance(data["data"], list):
+                        items = data["data"]
+                        all_items.extend(items)
+                        # Понять, есть ли еще страницы
+                        total = data.get("total", len(all_items))
+                        per_page = data.get("per_page", limit)
+                        current_page = data.get("current_page", page)
+                    elif "data" in data and isinstance(data["data"], dict):
+                        # Значит "data": { "items": [...], "total":..., "page":... }
+                        sub = data["data"]
+                        items = sub.get("items", [])
+                        all_items.extend(items)
+                        total = sub.get("total", len(all_items))
+                        per_page = sub.get("per_page", limit)
+                        current_page = sub.get("page", page)
+                    else:
+                        # fallback: если структура иная, логируем
+                        logger.warning("Unexpected JSON structure: %s", data)
+                        break
+
+                    # Если мы хотим проверять, есть ли следующая страница
+                    # можно посчитать, сколько уже собрали
+                    # Если all_items >= total, значит страниц больше нет
+                    if len(all_items) >= total:
+                        break
+                    else:
+                        page += 1
+                else:
+                    logger.warning("Unexpected JSON format: not a dict")
+                    break
+            else:
+                logger.error(f"CRM request failed with status {resp.status_code}")
+                break
+        except Exception as e:
+            logger.error(f"CRM request exception: {e}")
+            break
+
+    logger.info(f"Fetched total {len(all_items)} products from CRM (across pages).")
+    return all_items
 
 #
 # --- FOLLOW-UP LOGIC (NO RESPONSE) ---
@@ -305,6 +353,7 @@ async def get_chatgpt_response(prompt: str) -> str:
 #
 # --- BOT HANDLERS ---
 #
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     init_db()
@@ -470,22 +519,34 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
 
-    # 1) Получаем данные из KeyCRM
-    tours = fetch_crm_tours()
-    if not tours:
+    # 1) Получаем все продукты (туры) из KeyCRM (все страницы)
+    all_products = fetch_all_products()
+    if not all_products:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
     else:
         tours_info = "Актуальні тури з CRM:\n"
-        for t in tours:
-            # По документации /api/v1/products items[i] могут иметь поля:
-            # "id", "title", "price", "sku", и т.д.
-            product_id = t.get("id", "?")
-            title = t.get("title", "Тур без назви")
-            price = t.get("price", "0")
-            # При желании можно добавить другие поля
-            tours_info += f" - [ID {product_id}] {title}, ціна: {price}\n"
+        for p in all_products:
+            # Согласно примеру из /products:
+            # {
+            #   "id": 0,
+            #   "name": "Iphone XS max 256gb",
+            #   "price": 124.5,
+            #   "description": "...",
+            #   ...
+            # }
+            pid = p.get("id", "?")
+            pname = p.get("name", "No name")
+            pprice = p.get("price", 0)
+            pdesc = p.get("description", "")
+            tours_info += (
+                f"---\n"
+                f"ID: {pid}\n"
+                f"Назва: {pname}\n"
+                f"Ціна: {pprice}\n"
+                f"Опис: {pdesc}\n"
+            )
 
-    # 2) Базовая информация
+    # 2) Базовая информация о туре (статичная)
     if choice == "cost":
         text = (
             "Дата виїзду: 26 жовтня з Ужгорода та Мукачева. 🌟\n"
