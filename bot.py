@@ -22,6 +22,7 @@ from datetime import datetime
 from flask import Flask, request
 import asyncio
 import threading
+import time
 import re
 import requests  # Для обращения к KeyCRM
 
@@ -145,14 +146,22 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 # --- CRM INTEGRATION ---
 #
 
+# Глобальный список туров, регулярно обновляемый в фоне
+_GLOBAL_TOURS = []
+
 def fetch_all_products():
     """
     Получаем *все* продукты (туры) из KeyCRM, перебирая страницы, пока не кончатся.
     Для каждого запроса указываем limit=50 (максимум) и page=n.
     Возвращаем общий список (list) словарей.
+    Также сохраняем результат в _GLOBAL_TOURS, чтобы
+    при каждом вызове details_handler() данные были актуальны.
     """
+    global _GLOBAL_TOURS
+
     if not CRM_API_KEY or not CRM_API_URL:
         logger.warning("CRM_API_KEY or CRM_API_URL not found. Returning empty tours list.")
+        _GLOBAL_TOURS = []
         return []
 
     headers = {
@@ -162,7 +171,7 @@ def fetch_all_products():
 
     all_items = []
     page = 1
-    limit = 50  # максимум 50, согласно документации
+    limit = 50
 
     while True:
         params = {"page": page, "limit": limit}
@@ -170,54 +179,20 @@ def fetch_all_products():
             resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 data = resp.json()
-                # Ожидаем структуру:
-                # {
-                #   "total": 100,
-                #   "current_page": 1,
-                #   "per_page": 15,
-                #   "data": [...],
-                #   ...
-                # }
-                # или "data": {
-                #       "items": [...],
-                #       "page": 1,
-                #       ...
-                # }
-                # в зависимости от того, как KeyCRM формирует ответ.
-
-                # Смотрим, есть ли "data" (массив)
                 if isinstance(data, dict):
-                    # Есть вариант:
-                    # data["data"] = массив
-                    # Или data["data"]["items"] = массив
-                    # В документации: "data" — массив объектов
-                    # но иногда бывает "data": { "items": [...] }
-                    # Нужно проверить структуру. Предположим, что "data" — список продуктов
-                    # Но согласно doc: "data": [ {product}, ... ] (paged)
-                    # Либо "data": { "items": [...] } (тоже paged)
                     if "data" in data and isinstance(data["data"], list):
                         items = data["data"]
                         all_items.extend(items)
-                        # Понять, есть ли еще страницы
                         total = data.get("total", len(all_items))
-                        per_page = data.get("per_page", limit)
-                        current_page = data.get("current_page", page)
                     elif "data" in data and isinstance(data["data"], dict):
-                        # Значит "data": { "items": [...], "total":..., "page":... }
                         sub = data["data"]
                         items = sub.get("items", [])
                         all_items.extend(items)
                         total = sub.get("total", len(all_items))
-                        per_page = sub.get("per_page", limit)
-                        current_page = sub.get("page", page)
                     else:
-                        # fallback: если структура иная, логируем
                         logger.warning("Unexpected JSON structure: %s", data)
                         break
 
-                    # Если мы хотим проверять, есть ли следующая страница
-                    # можно посчитать, сколько уже собрали
-                    # Если all_items >= total, значит страниц больше нет
                     if len(all_items) >= total:
                         break
                     else:
@@ -233,7 +208,21 @@ def fetch_all_products():
             break
 
     logger.info(f"Fetched total {len(all_items)} products from CRM (across pages).")
+    _GLOBAL_TOURS = all_items  # Сохраняем в глобальную переменную
     return all_items
+
+def background_update_products():
+    """
+    Фоновая функция, регулярно обновляет список туров каждые 60 минут.
+    Запускается один раз при старте бота.
+    """
+    while True:
+        try:
+            fetch_all_products()
+        except Exception as e:
+            logger.error(f"Background update error: {e}")
+        # Ждём 1 час (3600 секунд) до следующего обновления
+        time.sleep(3600)
 
 #
 # --- FOLLOW-UP LOGIC (NO RESPONSE) ---
@@ -353,7 +342,6 @@ async def get_chatgpt_response(prompt: str) -> str:
 #
 # --- BOT HANDLERS ---
 #
-
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     init_db()
@@ -519,21 +507,13 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
 
-    # 1) Получаем все продукты (туры) из KeyCRM (все страницы)
-    all_products = fetch_all_products()
+    # 1) Получаем все продукты (туры) из KeyCRM (фактически _GLOBAL_TOURS обновлено фоном).
+    all_products = fetch_all_products()  # как и раньше, вызывается при каждом запросе
     if not all_products:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
     else:
         tours_info = "Актуальні тури з CRM:\n"
         for p in all_products:
-            # Согласно примеру из /products:
-            # {
-            #   "id": 0,
-            #   "name": "Iphone XS max 256gb",
-            #   "price": 124.5,
-            #   "description": "...",
-            #   ...
-            # }
             pid = p.get("id", "?")
             pname = p.get("name", "No name")
             pprice = p.get("price", 0)
@@ -808,6 +788,14 @@ async def run_bot():
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
     await application.start()
+
+    # Запуск фонового обновления туров
+    def start_background_updates():
+        th = threading.Thread(target=background_update_products, daemon=True)
+        th.start()
+
+    start_background_updates()
+
     loop = asyncio.get_running_loop()
     application.bot_data["loop"] = loop
     logger.info("Bot is online and ready.")
