@@ -69,8 +69,8 @@ WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
-# Проверка, что другие процессы бота не запущены
 def is_bot_already_running():
+    """Проверка, что другие процессы бота не запущены."""
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
         if (
@@ -146,7 +146,6 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 # --- CRM INTEGRATION ---
 #
 
-# Глобальный список туров, регулярно обновляемый в фоне
 _GLOBAL_TOURS = []
 
 def fetch_all_products():
@@ -154,8 +153,8 @@ def fetch_all_products():
     Получаем *все* продукты (туры) из KeyCRM, перебирая страницы, пока не кончатся.
     Для каждого запроса указываем limit=50 (максимум) и page=n.
     Возвращаем общий список (list) словарей.
-    Также сохраняем результат в _GLOBAL_TOURS, чтобы
-    при каждом вызове details_handler() данные были актуальны.
+    Сохраняем результат в _GLOBAL_TOURS для дальнейшего использования.
+    Добавлен расширенный лог и Content-Type.
     """
     global _GLOBAL_TOURS
 
@@ -166,7 +165,8 @@ def fetch_all_products():
 
     headers = {
         "Authorization": f"Bearer {CRM_API_KEY}",
-        "Accept": "application/json"
+        "Accept": "application/json",
+        "Content-Type": "application/json"
     }
 
     all_items = []
@@ -178,7 +178,12 @@ def fetch_all_products():
         try:
             resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
-                data = resp.json()
+                try:
+                    data = resp.json()
+                except Exception as parse_err:
+                    logger.error(f"Failed to parse JSON. Response text: {resp.text}")
+                    break
+
                 if isinstance(data, dict):
                     if "data" in data and isinstance(data["data"], list):
                         items = data["data"]
@@ -190,7 +195,7 @@ def fetch_all_products():
                         all_items.extend(items)
                         total = sub.get("total", len(all_items))
                     else:
-                        logger.warning("Unexpected JSON structure: %s", data)
+                        logger.warning(f"Unexpected JSON structure: {data}")
                         break
 
                     if len(all_items) >= total:
@@ -198,31 +203,29 @@ def fetch_all_products():
                     else:
                         page += 1
                 else:
-                    logger.warning("Unexpected JSON format: not a dict")
+                    logger.warning(f"Unexpected JSON format (not a dict). Response: {resp.text}")
                     break
             else:
-                logger.error(f"CRM request failed with status {resp.status_code}")
+                logger.error(f"CRM request failed. Status {resp.status_code}, response text: {resp.text}")
                 break
         except Exception as e:
             logger.error(f"CRM request exception: {e}")
             break
 
     logger.info(f"Fetched total {len(all_items)} products from CRM (across pages).")
-    _GLOBAL_TOURS = all_items  # Сохраняем в глобальную переменную
+    _GLOBAL_TOURS = all_items
     return all_items
 
 def background_update_products():
     """
     Фоновая функция, регулярно обновляет список туров каждые 60 минут.
-    Запускается один раз при старте бота.
     """
     while True:
         try:
             fetch_all_products()
         except Exception as e:
             logger.error(f"Background update error: {e}")
-        # Ждём 1 час (3600 секунд) до следующего обновления
-        time.sleep(3600)
+        time.sleep(3600)  # Обновляем каждые 60 минут
 
 #
 # --- FOLLOW-UP LOGIC (NO RESPONSE) ---
@@ -507,8 +510,8 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
 
-    # 1) Получаем все продукты (туры) из KeyCRM (фактически _GLOBAL_TOURS обновлено фоном).
-    all_products = fetch_all_products()  # как и раньше, вызывается при каждом запросе
+    # 1) Получаем все продукты (туры) из KeyCRM
+    all_products = fetch_all_products()
     if not all_products:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
     else:
