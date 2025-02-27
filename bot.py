@@ -22,7 +22,6 @@ from datetime import datetime
 from flask import Flask, request
 import asyncio
 import threading
-import time
 import re
 import requests  # Для обращения к KeyCRM
 
@@ -62,15 +61,22 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CRM_API_KEY = os.getenv("CRM_API_KEY")
-CRM_API_URL = os.getenv("CRM_API_URL", "https://familyplace.keycrm.app/api/v1/products")
+
+# Убираем возможные кавычки и пробелы
+_raw_crm_api_key = os.getenv("CRM_API_KEY", "").strip().strip('"')
+_raw_crm_api_url = os.getenv("CRM_API_URL", "https://openapi.keycrm.app/v1/products").strip().strip('"')
+
+CRM_API_KEY = _raw_crm_api_key
+CRM_API_URL = _raw_crm_api_url
+
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 
+# Инициализация OpenAI, если библиотека доступна и ключ задан
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
+# Проверка, что другие процессы бота не запущены
 def is_bot_already_running():
-    """Проверка, что другие процессы бота не запущены."""
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
         if (
@@ -146,86 +152,88 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
 # --- CRM INTEGRATION ---
 #
 
-_GLOBAL_TOURS = []
-
 def fetch_all_products():
     """
     Получаем *все* продукты (туры) из KeyCRM, перебирая страницы, пока не кончатся.
     Для каждого запроса указываем limit=50 (максимум) и page=n.
     Возвращаем общий список (list) словарей.
-    Сохраняем результат в _GLOBAL_TOURS для дальнейшего использования.
-    Добавлен расширенный лог и Content-Type.
     """
-    global _GLOBAL_TOURS
-
     if not CRM_API_KEY or not CRM_API_URL:
         logger.warning("CRM_API_KEY or CRM_API_URL not found. Returning empty tours list.")
-        _GLOBAL_TOURS = []
         return []
 
     headers = {
         "Authorization": f"Bearer {CRM_API_KEY}",
-        "Accept": "application/json",
-        "Content-Type": "application/json"
+        "Accept": "application/json"
     }
 
     all_items = []
     page = 1
-    limit = 50
+    limit = 50  # максимум 50, согласно документации
 
     while True:
         params = {"page": page, "limit": limit}
         try:
             resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                except Exception as parse_err:
-                    logger.error(f"Failed to parse JSON. Response text: {resp.text}")
-                    break
-
-                if isinstance(data, dict):
-                    if "data" in data and isinstance(data["data"], list):
-                        items = data["data"]
-                        all_items.extend(items)
-                        total = data.get("total", len(all_items))
-                    elif "data" in data and isinstance(data["data"], dict):
-                        sub = data["data"]
-                        items = sub.get("items", [])
-                        all_items.extend(items)
-                        total = sub.get("total", len(all_items))
-                    else:
-                        logger.warning(f"Unexpected JSON structure: {data}")
-                        break
-
-                    if len(all_items) >= total:
-                        break
-                    else:
-                        page += 1
-                else:
-                    logger.warning(f"Unexpected JSON format (not a dict). Response: {resp.text}")
-                    break
-            else:
-                logger.error(f"CRM request failed. Status {resp.status_code}, response text: {resp.text}")
+            # Проверяем статус
+            if resp.status_code != 200:
+                logger.error(f"CRM request failed with status {resp.status_code}")
                 break
+
+            # Пытаемся распарсить JSON
+            try:
+                data = resp.json()
+            except ValueError:
+                logger.error(f"Failed to parse JSON. Response text: {resp.text}")
+                break
+
+            # Ожидаем структуру:
+            # {
+            #   "total": 100,
+            #   "current_page": 1,
+            #   "per_page": 15,
+            #   "data": [...],
+            #   ...
+            # }
+            # или "data": {
+            #       "items": [...],
+            #       "page": 1,
+            #       ...
+            # }
+
+            if isinstance(data, dict):
+                if "data" in data and isinstance(data["data"], list):
+                    items = data["data"]
+                    all_items.extend(items)
+                    total = data.get("total", len(all_items))
+                    per_page = data.get("per_page", limit)
+                    current_page = data.get("current_page", page)
+                elif "data" in data and isinstance(data["data"], dict):
+                    sub = data["data"]
+                    items = sub.get("items", [])
+                    all_items.extend(items)
+                    total = sub.get("total", len(all_items))
+                    per_page = sub.get("per_page", limit)
+                    current_page = sub.get("page", page)
+                else:
+                    logger.warning("Unexpected JSON structure: %s", data)
+                    break
+
+                # Проверяем, есть ли ещё страницы
+                if len(all_items) >= total:
+                    break
+                else:
+                    page += 1
+            else:
+                logger.warning("Unexpected JSON format: not a dict")
+                break
+
         except Exception as e:
             logger.error(f"CRM request exception: {e}")
             break
 
     logger.info(f"Fetched total {len(all_items)} products from CRM (across pages).")
-    _GLOBAL_TOURS = all_items
     return all_items
-
-def background_update_products():
-    """
-    Фоновая функция, регулярно обновляет список туров каждые 60 минут.
-    """
-    while True:
-        try:
-            fetch_all_products()
-        except Exception as e:
-            logger.error(f"Background update error: {e}")
-        time.sleep(3600)  # Обновляем каждые 60 минут
 
 #
 # --- FOLLOW-UP LOGIC (NO RESPONSE) ---
@@ -258,7 +266,7 @@ def schedule_no_response_job(context: CallbackContext, chat_id: int):
 
 def cancel_no_response_job(context: CallbackContext):
     job_queue = context.job_queue
-    chat_id = context._chat_id if hasattr(context, '_chat_id') else None
+    chat_id = getattr(context, "_chat_id", None)
     if chat_id:
         current_jobs = job_queue.get_jobs_by_name(f"no_response_{chat_id}")
         for job in current_jobs:
@@ -345,6 +353,7 @@ async def get_chatgpt_response(prompt: str) -> str:
 #
 # --- BOT HANDLERS ---
 #
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     init_db()
@@ -510,7 +519,7 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
 
-    # 1) Получаем все продукты (туры) из KeyCRM
+    # 1) Получаем все продукты (туры) из KeyCRM (все страницы)
     all_products = fetch_all_products()
     if not all_products:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
@@ -563,7 +572,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    
+
     time_keywords = ["коли виїзд", "коли відправлення", "час виїзду", "коли автобус", "коли вирушаємо"]
     if any(k in user_text for k in time_keywords):
         answer_text = (
@@ -575,7 +584,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
-    
+
     booking_keywords = ["бронювати", "бронюй", "купувати тур", "давай бронювати", "окей давай бронювати", "окей бронюй тур"]
     if any(kw in user_text for kw in booking_keywords):
         response_text = (
@@ -584,7 +593,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         await typing_simulation(update, response_text)
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         return await close_deal_handler(update, context)
-    
+
     no_more_questions = ["немає", "все зрозуміло", "все ок", "досить", "спасибі", "дякую"]
     if any(k in user_text for k in no_more_questions):
         response_text = "Як вам наша пропозиція в цілому? 🌟"
@@ -592,7 +601,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_IMPRESSION, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_IMPRESSION
-    
+
     sentiment = get_sentiment(user_text)
     if sentiment == "negative":
         fallback_prompt = (
@@ -623,7 +632,7 @@ async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    
+
     positive_keywords = ["добре", "клас", "цікаво", "відмінно", "супер", "підходить", "так"]
     negative_keywords = ["ні", "не цікаво", "дорого", "завелика", "надто"]
     if any(k in user_text for k in positive_keywords):
@@ -655,7 +664,7 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    
+
     positive_keywords = ["приват", "моно", "оплачу", "готов", "готова", "давайте"]
     if any(k in user_text for k in positive_keywords):
         response_text = (
@@ -667,6 +676,7 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         save_user_state(user_id, STAGE_PAYMENT, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_PAYMENT
+
     negative_keywords = ["ні", "нет", "не буду", "не хочу"]
     if any(k in user_text for k in negative_keywords):
         response_text = "Зрозуміло. Буду рада допомогти, якщо передумаєте!"
@@ -687,7 +697,7 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    
+
     if any(keyword in user_text for keyword in ["оплатив", "відправив", "скинув", "готово"]):
         response_text = (
             "Дякую! Тепер перевірю надходження. Як тільки все буде ок, я надішлю деталі поїздки і підтвердження бронювання!"
@@ -791,14 +801,6 @@ async def run_bot():
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
     await application.start()
-
-    # Запуск фонового обновления туров
-    def start_background_updates():
-        th = threading.Thread(target=background_update_products, daemon=True)
-        th.start()
-
-    start_background_updates()
-
     loop = asyncio.get_running_loop()
     application.bot_data["loop"] = loop
     logger.info("Bot is online and ready.")
