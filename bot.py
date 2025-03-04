@@ -77,7 +77,6 @@ def is_bot_already_running():
 ) = range(12)
 
 NO_RESPONSE_DELAY_SECONDS = 6 * 3600
-
 app = Flask(__name__)
 application = None
 
@@ -257,7 +256,7 @@ async def get_chatgpt_response(prompt: str) -> str:
     try:
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-3.5-turbo",
+            model="gpt-4",
             messages=[{"role": "user", "content": prompt}],
             max_tokens=300,
             temperature=0.7
@@ -421,43 +420,50 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     cancel_no_response_job(context)
     choice = context.user_data.get("choice", "details")
-    all_products = fetch_all_products()
     user_text_lower = update.message.text.lower()
-    filtered_products = []
-    if "зоопарк" in user_text_lower or "нїредьгаза" in user_text_lower or "ніредьгаза" in user_text_lower:
+    all_products = fetch_all_products()
+    relevant_products = []
+    if "зоопарк" in user_text_lower or "ніредьгаза" in user_text_lower or "nire" in user_text_lower:
         for p in all_products:
-            n = p.get("name","").lower()
-            if "зоопарк" in n or "ніредьгаза" in n:
-                filtered_products.append(p)
+            nm = p.get("name","").lower()
+            if "зоопарк" in nm or "ніредьгаза" in nm:
+                relevant_products.append(p)
     else:
-        filtered_products = all_products
-    if not filtered_products:
+        relevant_products = all_products
+    if not relevant_products:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
     else:
-        tours_info = ""
-        for p in filtered_products:
+        if len(relevant_products) == 1:
+            p = relevant_products[0]
             pid = p.get("id", "?")
             pname = p.get("name", "No name")
             pprice = p.get("price", 0)
             pdesc = p.get("description", "")
             if not pdesc:
                 pdesc = "Без опису"
-            tours_info += (
-                "---\n"
-                f"ID: {pid}\n"
-                f"Назва: {pname}\n"
-                f"Ціна: {pprice}\n"
-                f"Опис: {pdesc}\n"
-            )
+            if choice == "cost":
+                tours_info = f"Ціна туру: {pprice} грн"
+            else:
+                tours_info = (
+                    f"Назва: {pname}\n"
+                    f"Ціна: {pprice}\n"
+                    f"Опис: {pdesc}"
+                )
+        else:
+            tours_info = "Актуальні тури з CRM:\n"
+            for p in relevant_products:
+                pid = p.get("id", "?")
+                pname = p.get("name", "No name")
+                pprice = p.get("price", 0)
+                pdesc = p.get("description", "")
+                if not pdesc:
+                    pdesc = "Без опису"
+                tours_info += f"---\nID: {pid}\nНазва: {pname}\nЦіна: {pprice}\nОпис: {pdesc}\n"
     if choice == "cost":
         text = (
             "Дата виїзду: 26 жовтня з Ужгорода та Мукачева. 🌟\n"
-            "Це цілий день, наповнений пригодами, і вже ввечері ви будете вдома, сповнені приємних спогадів.\n\n"
-            "Вартість туру становить 1900 грн з особи. Це ціна, що включає трансфер, квитки до зоопарку, страхування та супровід. "
-            "Ви платите один раз і більше не турбуєтеся про жодні організаційні моменти! 🏷️\n\n"
-            "Подорож на комфортабельному автобусі із зарядками для гаджетів і клімат-контролем. 🚌\n"
-            "Наш супровід вирішує всі організаційні питання в дорозі, а діти отримають море позитивних емоцій! 🎉\n\n"
-            + ("Актуальні тури з CRM:\n" + tours_info if tours_info else "Немає турів за запитом.")
+            "Цілий день пригод, ввечері ви вдома.\n"
+            + tours_info
         )
     else:
         text = (
@@ -465,10 +471,10 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Тривалість: Цілий день, ввечері Ви вже вдома.\n"
             "Транспорт: Комфортабельний автобус із клімат-контролем та зарядками. 🚌\n"
             "Зоопарк: Більше 500 видів тварин, шоу морських котиків, фото та багато вражень! 🦁\n"
-            "Харчування: За власний рахунок, але у нас передбачений час для обіду. 🍽️\n"
-            "Додаткові розваги: Після відвідування зоопарку ми заїдемо до великого торгового центру.\n"
-            "Вартість туру: 1900 грн з особи. У вартість входить трансфер, квитки до зоопарку, медичне страхування та супровід. 🏷️\n\n"
-            + ("Актуальні тури з CRM:\n" + tours_info if tours_info else "Немає турів за запитом.")
+            "Харчування: За власний рахунок, але передбачений час для обіду. 🍽️\n"
+            "Додаткові розваги: Після зоопарку заїдемо до торгового центру.\n"
+            "Вартість: 1900 грн (трансфер, квитки, страхування, супровід). 🏷️\n\n"
+            + tours_info
         )
     await typing_simulation(update, text)
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
