@@ -24,7 +24,6 @@ import threading
 import re
 import requests
 
-# pydantic для строгой валидации данных из CRM
 try:
     from pydantic import BaseModel, Field, ValidationError
 except ImportError:
@@ -60,6 +59,9 @@ WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", 'https://your-app.onrender.com')
 if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
+# Глобальный кэш с турами, чтобы не ходить в CRM всякий раз
+CRM_CACHE = []
+
 def is_bot_already_running():
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
@@ -71,7 +73,6 @@ def is_bot_already_running():
             return True
     return False
 
-# Опциональная модель для валидации данных из CRM
 if BaseModel is not None:
     class ProductModel(BaseModel):
         id: int
@@ -136,6 +137,11 @@ def save_user_state(user_id: str, current_stage: int, user_data: dict):
     conn.close()
 
 def fetch_all_products():
+    """
+    Базовый метод: достаём туры из CRM.
+    Теперь будет вызываться раз в N минут через планировщик,
+    а также при старте для первичного наполнения кэша CRM_CACHE.
+    """
     if not CRM_API_KEY or not CRM_API_URL:
         logger.warning("CRM_API_KEY or CRM_API_URL not found. Returning empty tours list.")
         return []
@@ -157,20 +163,16 @@ def fetch_all_products():
                     break
 
                 if isinstance(data, dict):
-                    # Предполагаем: data["data"] - список
                     if "data" in data and isinstance(data["data"], list):
                         items = data["data"]
                         for it in items:
-                            validated = None
                             if BaseModel is not None:
-                                # Попытка валидации через pydantic
                                 try:
                                     validated = ProductModel(**it)
                                     all_items.append(validated.dict())
                                 except ValidationError:
                                     logger.warning("Invalid product data %s", it)
                             else:
-                                # Если pydantic нет, берём как есть
                                 all_items.append(it)
                         total = data.get("total", len(all_items))
                     else:
@@ -230,41 +232,71 @@ def cancel_no_response_job(context: CallbackContext):
 
 async def typing_simulation(update: Update, text: str):
     await update.effective_chat.send_action(ChatAction.TYPING)
-    # Добавляем чуть более реалистическую задержку
     await asyncio.sleep(min(4, max(2, len(text)/70)))
     await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
+# ======================
+# Дополнительная логика
+# ======================
+
+def detect_toxic(text: str) -> bool:
+    rude = ["дурак","тупой","ебнулся","идиот","stfu","fuck","shit","блять","сука","хуй","придурок"]
+    return any(r in text.lower() for r in rude)
+
 def is_positive_response(text: str) -> bool:
-    arr = ["так","добре","да","ок","продовжуємо","розкажіть","готовий","готова","привіт","hello","расскажи","зацікав","зацікавлений"]
+    arr = [
+        "так","добре","да","ок","продовжуємо","продовжити","продовжить","розкажіть",
+        "готовий","готова","привіт","hello","зацікав","зацікавлений",
+        "ага","хочу","буду","yes","интересно","интересует","заинтересован","зацікавлен","готов"
+    ]
     return any(k in text.lower() for k in arr)
 
 def is_negative_response(text: str) -> bool:
-    arr = ["не хочу","не можу","нет","ні","не буду","не зараз"]
+    arr = [
+        "не хочу","не можу","нет","ні","не буду","не зараз","отмена","cancel",
+        "передумав","передумала","неинтересно","надоело","хватит"
+    ]
     return any(k in text.lower() for k in arr)
 
-def detect_toxic(text: str) -> bool:
-    # Простейшая проверка грубых слов
-    rude = ["дурак","тупой","ебнулся","идиот","стукач","урод","fuck","shit","блять","сука"]
-    return any(r in text.lower() for r in rude)
-
-def analyze_intent(text: str) -> str:
-    if nlp_uk:
-        doc = nlp_uk(text)
-        lemmas = [token.lemma_.lower() for token in doc]
-        pos = {"так","добре","да","ок","продовжувати","розповісти","готовий","готова","привіт","hello","зацікавити","зацікавлений"}
-        neg = {"не","нехочу","неможу","нет","ні","небуду","не зараз"}
-        if any(kw in lemmas for kw in pos):
-            return "positive"
-        if any(kw in lemmas for kw in neg):
-            return "negative"
+# Пример «умного» анализа намерения через GPT
+async def chatgpt_intent_analysis(text: str) -> str:
+    """
+    С помощью GPT пытаемся отнести ответ к одной из категорий:
+    'details', 'cost', 'booking', 'negative', 'positive', 'unclear'.
+    """
+    if openai is None or not OPENAI_API_KEY:
         return "unclear"
-    else:
-        if is_positive_response(text):
-            return "positive"
-        elif is_negative_response(text):
-            return "negative"
-        else:
+    system_prompt = (
+        "Ты — бот по продаже однодневных туров в зоопарк Ньїредьгаза, Угорщина. "
+        "Тебе дано сообщение пользователя: оцени, к какому это относится:\n"
+        "1) details — пользователь хочет узнать детали тура (что включено, программа);\n"
+        "2) cost — спрашивает цену/стоимость;\n"
+        "3) booking — хочет забронировать/купить/заплатить;\n"
+        "4) negative — отказывает/не хочет;\n"
+        "5) positive — соглашается/да (продолжить разговор);\n"
+        "6) unclear — не понятно.\n\n"
+        "Отвечай одним словом на английском: details / cost / booking / negative / positive / unclear."
+    )
+    user_prompt = f"User message: '{text}'"
+    try:
+        response = await asyncio.to_thread(
+            openai.ChatCompletion.create,
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=10,
+            temperature=0.0
+        )
+        cat = response.choices[0].message.content.strip().lower()
+        # Подстрахуемся
+        if cat not in ["details","cost","booking","negative","positive","unclear"]:
             return "unclear"
+        return cat
+    except Exception as e:
+        logger.error("chatgpt_intent_analysis error: %s", e)
+        return "unclear"
 
 def get_sentiment(text: str) -> str:
     if sentiment_pipeline:
@@ -286,7 +318,6 @@ async def get_chatgpt_response(prompt: str) -> str:
     if openai is None or not OPENAI_API_KEY:
         return "Вибачте, функція ChatGPT недоступна."
     try:
-        # Более конкретная инструкция GPT
         messages = [
             {
                 "role": "system",
@@ -294,14 +325,14 @@ async def get_chatgpt_response(prompt: str) -> str:
                     "Ты — бот, специализирующийся на однодневном туре в зоопарк Ньїредьгаза. "
                     "Отвечай коротко, позитивно, используя дружелюбный стиль, чётко соблюдай сценарий тура. "
                     "Если вопрос выходит за рамки, всё равно постарайся вплести упоминание зоопарка "
-                    "или коротко извинись и предложи вернуться к туризму. "
+                    "или кратко извинись и предложи вернуться к туризму."
                 )
             },
             {"role": "user", "content": prompt}
         ]
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-4",
+            model="gpt-4",  # Или "gpt-3.5-turbo"
             messages=messages,
             max_tokens=300,
             temperature=0.6
@@ -311,22 +342,23 @@ async def get_chatgpt_response(prompt: str) -> str:
         logger.error("Error calling ChatGPT: %s", e)
         return "Вибачте, сталася помилка при генерації відповіді."
 
+# ======================
+# Обработчики состояний
+# ======================
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     init_db()
     cancel_no_response_job(context)
     stg, dat = load_user_state(user_id)
     if stg is not None and dat is not None:
-        # Короткое напоминание о том, на чём мы остановились
-        short_reminder = ""
+        short_reminder = "У вас є незавершена розмова."
         if stg == STAGE_CLOSE_DEAL:
             short_reminder = "Ви зупинилися на етапі бронювання та оплати."
         elif stg == STAGE_DETAILS:
             short_reminder = "Ви зупинилися на етапі уточнення деталей туру."
         elif stg == STAGE_ADDITIONAL_QUESTIONS:
             short_reminder = "Ви зупинилися на етапі додаткових питань про тур."
-        else:
-            short_reminder = "У вас є незавершена розмова."
 
         text = (
             f"{short_reminder}\n"
@@ -334,7 +366,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Відповідайте: 'Продовжити' або 'Почати заново'."
         )
         await typing_simulation(update, text)
-        # Сохраняем, что мы перескочили на greet stage
         save_user_state(user_id, STAGE_GREET, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_GREET
@@ -350,16 +381,18 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    txt = update.message.text.strip()
+    txt = update.message.text.strip().lower()
     cancel_no_response_job(context)
 
+    # 1) Токсичность?
     if detect_toxic(txt):
         await typing_simulation(update, "Давайте збережемо приємну атмосферу розмови 😊. Чи є у вас запитання щодо туру?")
         save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    if "продовжити" in txt.lower():
+    # 2) Пользователь хочет продолжить?
+    if "продовжити" in txt:
         stg, dat = load_user_state(user_id)
         if stg is not None:
             context.user_data.update(json.loads(dat))
@@ -374,7 +407,8 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             schedule_no_response_job(context, update.effective_chat.id)
             return STAGE_GREET
 
-    if "почати" in txt.lower() or "заново" in txt.lower():
+    # 3) Пользователь хочет начать заново?
+    if "почати" in txt or "заново" in txt:
         context.user_data.clear()
         g = (
             "Вітаю вас! 😊 Ви зацікавились одноденним туром в зоопарк Ньїредьгаза, Угорщина. "
@@ -385,8 +419,8 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_GREET
 
-    intent = analyze_intent(txt)
-    if intent == "positive":
+    # 4) Проверяем intent "вручную"
+    if is_positive_response(txt):
         t = (
             "Дякую за вашу зацікавленість! 😊\n"
             "Звідки вам зручніше виїжджати: з Ужгорода чи Мукачева? 🚌"
@@ -395,7 +429,7 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user_state(user_id, STAGE_DEPARTURE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DEPARTURE
-    elif intent == "negative":
+    elif is_negative_response(txt):
         m = (
             "Я можу коротко розповісти про наш тур, якщо зараз вам незручно відповідати на питання."
         )
@@ -404,12 +438,41 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DETAILS
 
-    fp = (
+    # 5) Если наши простые проверки не помогли — вызываем GPT
+    intent_gpt = await chatgpt_intent_analysis(txt)
+    if intent_gpt in ["positive"]:
+        await typing_simulation(update, "Чудово! Звідки вам зручніше виїжджати: з Ужгорода чи Мукачева? 🚌")
+        save_user_state(user_id, STAGE_DEPARTURE, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_DEPARTURE
+    elif intent_gpt in ["negative"]:
+        await typing_simulation(update, "Добре, тоді можу коротко розповісти або закінчити? Що ви обираєте?")
+        save_user_state(user_id, STAGE_DETAILS, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_DETAILS
+    elif intent_gpt in ["details"]:
+        await typing_simulation(update, "Зрозуміло, давайте розкажу детальніше про програму туру...")
+        save_user_state(user_id, STAGE_DETAILS, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_DETAILS
+    elif intent_gpt in ["cost"]:
+        await typing_simulation(update, "Звісно, розкажу про вартість і що входить в тур.")
+        save_user_state(user_id, STAGE_DETAILS, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_DETAILS
+    elif intent_gpt in ["booking"]:
+        await typing_simulation(update, "Ви бажаєте забронювати місце? Тоді перейдімо до оформлення!")
+        save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_CLOSE_DEAL
+
+    # Если и GPT не дало результата -> fallback
+    fallback_text = await get_chatgpt_response(
         "Ось питання від клієнта: " + txt +
         "\nВідповідай українською мовою, дотримуючись сценарію одноденного туру до зоопарку Ньїредьгаза."
     )
-    fallback_text = await get_chatgpt_response(fp)
     await typing_simulation(update, fallback_text)
+    # Остаёмся в том же состоянии
     return STAGE_GREET
 
 async def departure_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,7 +504,7 @@ async def travel_party_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    if "дит" in txt:
+    if "дит" in txt or "child" in txt or "ребен" in txt:
         context.user_data["travel_party"] = "child"
         await typing_simulation(update, "Скільки років вашій дитині?")
         save_user_state(user_id, STAGE_CHILD_AGE, context.user_data)
@@ -474,7 +537,7 @@ async def child_age_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CHOICE
 
-    if any(x in t.lower() for x in ["детал","вартість","ціна","брон"]):
+    if any(x in t.lower() for x in ["детал","вартість","ціна","брон","cost","details"]):
         context.user_data["child_age"] = "unspecified"
         rr = "Добре, перейдемо далі."
         await typing_simulation(update, rr)
@@ -497,15 +560,15 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    if "деталь" in txt or "деталі" in txt:
+    if "детал" in txt or "details" in txt:
         context.user_data["choice"] = "details"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         return await details_handler(update, context)
-    elif "вартість" in txt or "ціна" in txt:
+    elif "вартість" in txt or "ціна" in txt or "cost" in txt:
         context.user_data["choice"] = "cost"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         return await details_handler(update, context)
-    elif "брон" in txt:
+    elif "брон" in txt or "bронируй" in txt or "booking" in txt or "забронировать" in txt or "поїхати" in txt:
         context.user_data["choice"] = "booking"
         r = (
             "Я дуже рада, що Ви обрали подорож з нами, це буде дійсно крута поїздка. "
@@ -529,22 +592,18 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     choice = context.user_data.get("choice","details")
 
-    prods = fetch_all_products()
-
-    # Фильтруем только "Зоопарк Ніредьгаза" (если цена > 0, иначе может быть нерелевантно)
+    # Берём из кэша, чтобы не бегать в CRM каждый раз
     relevant = []
-    for p in prods:
+    for p in CRM_CACHE:
         nm = (p.get("name","") or "").lower()
-        pr = p.get("price",0)
-        # Условие: если "ніредьгаза" или "зоопарк" в названии и цена > 0
-        if ("ніред" in nm or "зоопарк" in nm) and pr > 0:
+        pr = p.get("price", 0)
+        # ищем по слову "ніред", "нир", "зоопарк", + pr>0
+        if ("ніред" in nm or "нир" in nm or "зоопарк" in nm) and pr > 0:
             relevant.append(p)
 
-    # Если нет релевантных
     if not relevant:
         tours_info = "Наразі немає актуальних (або ціна=0) турів у CRM, пов'язаних із Ньїредьгазою."
     else:
-        # Покажем только релевантные
         if len(relevant) == 1:
             p = relevant[0]
             pname = p.get("name","No name")
@@ -559,12 +618,11 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pprice = p.get("price",0)
                 tours_info += f"- {pname} (ID {pid}), ціна: {pprice}\n"
 
-    # Если user спрашивает "cost"
     if choice == "cost":
         text = (
             "Дата виїзду: 26 жовтня з Ужгорода (6:00) та Мукачева (6:30).\n"
             "Це цілий день, і ввечері ви будете вдома.\n"
-            "Вартість туру: 1900 грн з особи (включає трансфер, квитки, страхування).\n\n"
+            "Вартість туру: 1900 грн з особи (трансфер, квитки, страхування).\n\n"
             + tours_info
         )
     else:
@@ -594,9 +652,11 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    time_keys = ["коли виїзд","коли відправлення","час виїзду","коли автобус","коли вирушаємо","во сколько выезд","сколько выезд"]
+    time_keys = [
+        "коли виїзд","коли відправлення","час виїзду","коли автобус","коли вирушаємо",
+        "во сколько выезд","сколько выезд","о котрій виїзд","когда выезд"
+    ]
     if any(k in txt for k in time_keys):
-        # Сразу даём точное время без лишних уточнений
         ans = (
             "Виїзд о 6:00 з Ужгорода, о 6:30 з Мукачева, повертаємось орієнтовно о 20:00.\n"
             "Чи є ще запитання?"
@@ -606,14 +666,17 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    book_keys = ["бронювати","бронюй","купувати тур","давай бронювати","окей давай бронювати","окей бронюй тур"]
-    if any(k in txt for kw in book_keys):
+    book_keys = [
+        "бронювати","бронюй","купувати тур","давай бронювати","окей давай бронювати",
+        "окей бронюй тур","бронируй","хочу поїхати","хочу забронировать","давай поедем","поедем","поехать"
+    ]
+    if any(k in txt for k in book_keys):
         r = "Добре, переходимо до оформлення бронювання. Я надам вам реквізити для оплати."
         await typing_simulation(update, r)
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         return await close_deal_handler(update, context)
 
-    no_more = ["немає","все зрозуміло","все ок","досить","спасибі","дякую"]
+    no_more = ["немає","все зрозуміло","все ок","досить","спасибі","дякую","спасибо","нет вопросов","ok"]
     if any(k in txt for k in no_more):
         rr = "Як вам наша пропозиція в цілому? 🌟"
         await typing_simulation(update, rr)
@@ -631,20 +694,13 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         await typing_simulation(update, fallback_text)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    intent = analyze_intent(txt)
-    if intent == "unclear":
-        prompt = (
-            "Клієнт задав нестандартне запитання: " + txt +
-            "\nВідповідай коротко, згадуй зоопарк Ньїредьгаза і відповідай позитивно."
-        )
-        fb = await get_chatgpt_response(prompt)
-        await typing_simulation(update, fb)
-        return STAGE_ADDITIONAL_QUESTIONS
-
-    ans = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте.\n\nЧи є ще запитання?"
-    await typing_simulation(update, ans)
-    save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
-    schedule_no_response_job(context, update.effective_chat.id)
+    # GPT fallback при непонятном вопросе
+    prompt = (
+        "Клієнт задав нестандартне запитання: " + txt +
+        "\nВідповідай коротко, згадуй зоопарк Ньїредьгаза і відповідай позитивно."
+    )
+    fb = await get_chatgpt_response(prompt)
+    await typing_simulation(update, fb)
     return STAGE_ADDITIONAL_QUESTIONS
 
 async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -658,8 +714,8 @@ async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    pos = ["добре","клас","цікаво","відмінно","супер","підходить","так"]
-    neg = ["ні","не цікаво","дорого","завелика","надто"]
+    pos = ["добре","клас","цікаво","відмінно","супер","підходить","так","отлично","круто","подходит"]
+    neg = ["ні","не цікаво","дорого","завелика","надто","не подходит","нет","не хочу"]
     if any(k in txt for k in pos):
         r = (
             "Чудово! 🎉 Давайте забронюємо місце для вас і вашої дитини, щоб забезпечити комфортний відпочинок. "
@@ -694,7 +750,10 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    pos = ["приват","моно","оплачу","готов","готова","давайте","monobank","privatbank"]
+    pos = [
+        "приват","моно","оплачу","готов","готова","давайте","monobank","privatbank",
+        "оплатил","оплатила","я перевел","я перевела","ok"
+    ]
     if any(k in txt for k in pos):
         r = (
             "Чудово! Ось реквізити для оплати:\n"
@@ -706,7 +765,7 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_PAYMENT
 
-    neg = ["ні","нет","не буду","не хочу"]
+    neg = ["ні","нет","не буду","не хочу","отмена","cancel","передумав","не сейчас"]
     if any(k in txt for k in neg):
         r2 = "Зрозуміло. Буду рада допомогти, якщо передумаєте!"
         await typing_simulation(update, r2)
@@ -730,7 +789,7 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
 
-    if any(k in txt for k in ["оплатив","відправив","скинув","готово","сплатив"]):
+    if any(k in txt for k in ["оплатив","відправив","скинув","готово","сплатив","перевел","перевела"]):
         r = (
             "Дякую! Тепер перевірю надходження. Як тільки все буде ок, я надішлю деталі поїздки і підтвердження бронювання!"
         )
@@ -787,6 +846,16 @@ def webhook():
             logger.error("No event loop available to process update.")
     return "OK"
 
+async def scheduled_crm_update(context: CallbackContext):
+    """
+    Периодически обновляем CRM_CACHE.
+    """
+    global CRM_CACHE
+    logger.info("Running scheduled CRM update...")
+    new_data = fetch_all_products()
+    CRM_CACHE = new_data  # Перезаписываем
+    logger.info("CRM_CACHE updated with %d products.", len(CRM_CACHE))
+
 async def setup_webhook(url, app_ref):
     webhook_url = f"{url}/webhook"
     await app_ref.bot.set_webhook(webhook_url)
@@ -802,6 +871,10 @@ async def run_bot():
     global application
     application = application_builder.build()
 
+    # Изначально заполняем CRM_CACHE
+    global CRM_CACHE
+    CRM_CACHE = fetch_all_products()
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -816,7 +889,9 @@ async def run_bot():
             STAGE_CLOSE_DEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_deal_handler)],
             STAGE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_handler)],
             STAGE_PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm_handler)],
-            STAGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: c.bot.send_message(chat_id=u.effective_chat.id, text="Дякую! Якщо виникнуть питання — /start."))]
+            STAGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                lambda u,c: c.bot.send_message(chat_id=u.effective_chat.id,
+                                               text="Дякую! Якщо виникнуть питання — /start."))]
         },
         fallbacks=[CommandHandler('cancel', cancel_command)],
         allow_reentry=True
@@ -824,6 +899,11 @@ async def run_bot():
     application.add_handler(conv_handler)
 
     await setup_webhook(WEBHOOK_URL, application)
+
+    # Запланировать периодическое обновление CRM, например, раз в час
+    job_queue = application.job_queue
+    job_queue.run_repeating(scheduled_crm_update, interval=3600, first=10)
+
     await application.initialize()
     await application.start()
     loop = asyncio.get_running_loop()
