@@ -24,6 +24,13 @@ import threading
 import re
 import requests
 
+# Fuzzy matching
+from rapidfuzz import fuzz, process
+
+# Pydantic для строгой валидации данных из CRM
+from pydantic import BaseModel, ValidationError, Field
+from typing import Optional, List
+
 try:
     import spacy
     nlp_uk = spacy.load("uk_core_news_sm")
@@ -84,6 +91,23 @@ NO_RESPONSE_DELAY_SECONDS = 6 * 3600
 app = Flask(__name__)
 application = None
 
+############################################################
+# Pydantic Models для CRM
+############################################################
+class TourItem(BaseModel):
+    id: int
+    name: str = Field(..., min_length=1)
+    price: float
+    description: Optional[str] = None
+
+class CRMResponse(BaseModel):
+    total: int
+    current_page: int
+    per_page: int
+    data: List[TourItem]
+
+############################################################
+
 def init_db():
     conn = sqlite3.connect("bot_database.db")
     c = conn.cursor()
@@ -135,33 +159,22 @@ def fetch_all_products():
             resp = requests.get(CRM_API_URL, headers=headers, params=params, timeout=10)
             if resp.status_code == 200:
                 try:
-                    data = resp.json()
+                    data_json = resp.json()
                 except json.JSONDecodeError:
                     logger.error(f"Failed to parse JSON. Response text: {resp.text}")
                     break
-                if isinstance(data, dict):
-                    if "data" in data and isinstance(data["data"], list):
-                        items = data["data"]
-                        all_items.extend(items)
-                        total = data.get("total", len(all_items))
-                        per_page = data.get("per_page", limit)
-                        current_page = data.get("current_page", page)
-                    elif "data" in data and isinstance(data["data"], dict):
-                        sub = data["data"]
-                        items = sub.get("items", [])
-                        all_items.extend(items)
-                        total = sub.get("total", len(all_items))
-                        per_page = sub.get("per_page", limit)
-                        current_page = sub.get("page", page)
-                    else:
-                        logger.warning("Unexpected JSON structure: %s", data)
-                        break
-                    if len(all_items) >= total:
+                # Пробуем валидировать pydantic-модель CRMResponse
+                try:
+                    validated = CRMResponse(**data_json)
+                    # Если всё ок, добавляем items
+                    all_items.extend(validated.data)
+                    # Проверяем, достигли ли мы total
+                    if len(all_items) >= validated.total:
                         break
                     else:
                         page += 1
-                else:
-                    logger.warning("Unexpected JSON format: not a dict, got %r", data)
+                except ValidationError as ve:
+                    logger.error(f"Validation error from pydantic: {ve}")
                     break
             else:
                 logger.error(f"CRM request failed with status {resp.status_code}")
@@ -169,8 +182,13 @@ def fetch_all_products():
         except Exception as e:
             logger.error(f"CRM request exception: {e}")
             break
-    logger.info(f"Fetched total {len(all_items)} products from CRM (across pages).")
-    return all_items
+    # Возвращаем список dict, потому что дальше код работает с dict
+    # Можно вернуть и pydantic-модели, но для совместимости ниже — dict
+    results = []
+    for item in all_items:
+        results.append(item.dict())
+    logger.info(f"Fetched total {len(results)} products from CRM (across pages).")
+    return results
 
 def no_response_callback(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
@@ -213,13 +231,18 @@ async def typing_simulation(update: Update, text: str):
 
 def is_positive_response(text: str) -> bool:
     arr = ["так","добре","да","ок","продовжуємо","розкажіть","готовий","готова","привіт","hello","расскажи","зацікав","зацікавлений"]
-    return any(k in text.lower() for k in arr)
+    # Применим fuzzy
+    # Если хоть одно из arr даёт высокий скор, считаем positive
+    best_match, score = process.extractOne(text.lower(), arr, scorer=fuzz.partial_ratio)
+    return (score >= 80)
 
 def is_negative_response(text: str) -> bool:
     arr = ["не хочу","не можу","нет","ні","не буду","не зараз"]
-    return any(k in text.lower() for k in arr)
+    best_match, score = process.extractOne(text.lower(), arr, scorer=fuzz.partial_ratio)
+    return (score >= 80)
 
 def analyze_intent(text: str) -> str:
+    # Попробуем через spaCy, если доступно
     if nlp_uk:
         doc = nlp_uk(text)
         lemmas = [token.lemma_.lower() for token in doc]
@@ -256,49 +279,24 @@ def get_sentiment(text: str) -> str:
 
 async def get_chatgpt_response(prompt: str) -> str:
     """
-    Вызов ChatGPT, модель 'gpt-4.5' (условное название).
-    В system-инструкции заложена вся презентация и сценарии,
-    чтобы бот строго придерживался этапов продаж и контента.
+    Вызов ChatGPT, модель 'gpt-4'.
     """
     if openai is None or not OPENAI_API_KEY:
         return "Вибачте, функція ChatGPT недоступна."
     try:
-        # Полная системная инструкция, где зашиты презентации:
         system_prompt = (
-            "Ты — бот, который ведёт однодневный тур в зоопарк Ньїредьгаза. "
-            "У тебя есть два больших текста (Презентация 1 и Презентация 2). "
-            "Ты должен чётко следовать этапам продаж и информации из них. "
-            "Вот важные моменты:\n\n"
-            "=== Презентация 1 (этапы продаж) ===\n"
-            "Етап 1: Вітання...\n"
-            "Етап 2: Якщо клієнт не хоче...\n"
-            "...\n"
-            "Етап 8: Підтвердження оплати...\n"
-            "СЦЕНАРІЙ №2...\n"
-            "Варіант 3 - бронювання місця...\n"
-            "...\n"
-            "4. Закриття угоди (Етап бронювання та підтвердження)...\n"
-            "...\n"
-            "5. Додаткові сценарії...\n"
-            "(Полный текст презентации 1)\n\n"
-            "=== Презентация 2 (детали тура) ===\n"
-            "Дорогі мандрівникі!...\n"
-            "(Полный текст презентации 2)\n\n"
-            "Ты должен:\n"
-            "1) Отвечать коротко, позитивно.\n"
-            "2) Использовать стиль, соответствующий описанным этапам.\n"
-            "3) При любых вопросах стараться брать инфу из этих презентаций.\n"
-            "4) Если вопрос не по теме, стараться мягко вернуть к теме тура.\n"
-            "5) Модель: gpt-4.5 (условно)."
+            "Ты — бот, который ведёт однодневный тур в зоопарк Ньїредьгаза, Угорщина. "
+            "Есть презентации (1 и 2) с этапами продаж и деталями тура. "
+            "Следуй этим этапам, будь позитивным, коротким, учитывай CRM, "
+            "и используй 'gpt-4' для логики. Не выходи за рамки продаж."
         )
-
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt}
         ]
         response = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-4.5",
+            model="gpt-4",
             messages=messages,
             max_tokens=300,
             temperature=0.6
@@ -307,6 +305,10 @@ async def get_chatgpt_response(prompt: str) -> str:
     except Exception as e:
         logger.error("Error calling ChatGPT: %s", e)
         return "Вибачте, сталася помилка при генерації відповіді."
+
+############################################################
+# ==== HANDLERS ====
+############################################################
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -379,6 +381,7 @@ async def greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_DETAILS
+    # fallback
     fp = (
         "В рамках сценарію тура, клієнт написав: " + txt +
         "\nВідповідай українською мовою, дотримуючись сценарію тура."
@@ -402,7 +405,9 @@ async def travel_party_handler(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = str(update.effective_user.id)
     txt = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    if "дит" in txt:
+    # fuzzy check "дит" (слово "дитина") or synonyms
+    best, score = process.extractOne(txt, ["дитина","ребёнок","дитиною","дит"], scorer=fuzz.partial_ratio)
+    if score >= 70:
         context.user_data["travel_party"] = "child"
         await typing_simulation(update, "Скільки років вашій дитині?")
         save_user_state(user_id, STAGE_CHILD_AGE, context.user_data)
@@ -441,15 +446,22 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     txt = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    if "деталь" in txt or "деталі" in txt:
+    # fuzzy matching
+    # possible triggers
+    detail_words = ["деталі","деталь","details"]
+    cost_words = ["вартість","ціна","cost"]
+    book_words = ["брон","броню","booking"]
+    best, score = process.extractOne(txt, detail_words + cost_words + book_words, scorer=fuzz.partial_ratio)
+
+    if best in detail_words and score >= 70:
         context.user_data["choice"] = "details"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         return await details_handler(update, context)
-    elif "вартість" in txt or "ціна" in txt:
+    elif best in cost_words and score >= 70:
         context.user_data["choice"] = "cost"
         save_user_state(user_id, STAGE_DETAILS, context.user_data)
         return await details_handler(update, context)
-    elif "брон" in txt:
+    elif best in book_words and score >= 70:
         context.user_data["choice"] = "booking"
         r = (
             "Я дуже рада, що Ви обрали подорож з нами, це буде дійсно крута поїздка. "
@@ -461,6 +473,7 @@ async def choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CLOSE_DEAL
+    # fallback
     resp = "Будь ласка, уточніть: вас цікавлять деталі туру, вартість чи бронювання місця?"
     await typing_simulation(update, resp)
     save_user_state(user_id, STAGE_CHOICE, context.user_data)
@@ -473,19 +486,34 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     choice = context.user_data.get("choice","details")
     prods = fetch_all_products()
     txt = update.message.text.lower()
+
+    # fuzzy match for "зоопарк" or "ніредьгаза"
+    zoo_words = ["зоопарк","ніредьгаза","ниредьгаза","niredyhaza"]
+    matched = False
+    for w in zoo_words:
+        if fuzz.partial_ratio(w, txt) >= 70:
+            matched = True
+            break
+
     fprods = []
-    if any(x in txt for x in ["зоопарк","ніредьгаза","нїредьгаза"]):
+    if matched:
+        # берем только те товары, где name содержит "зоопарк" или "ніредьгаза"
         for p in prods:
-            n = p.get("name","").lower()
-            if "зоопарк" in n or "ніредьгаза" in n:
+            name_lower = p.get("name","").lower()
+            if "зоопарк" in name_lower or "ніредьгаза" in name_lower:
                 fprods.append(p)
     else:
         fprods = prods
+
     if not fprods:
         tours_info = "Наразі немає актуальних турів у CRM або стався збій."
     else:
-        if len(fprods) == 1:
-            p = fprods[0]
+        # Фильтруем туры, у которых price>0, т.к. 0 часто = тестовый
+        valid_tours = [x for x in fprods if x.get("price",0)>0]
+        if not valid_tours:
+            tours_info = "Наразі немає актуальних (або ціна=0) турів у CRM, пов'язаних із Ньїредьгазою."
+        elif len(valid_tours) == 1:
+            p = valid_tours[0]
             pname = p.get("name","No name")
             pprice = p.get("price",0)
             pdesc = p.get("description","")
@@ -494,11 +522,12 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             tours_info = f"Тур: {pname}\nЦіна: {pprice}\nОпис: {pdesc}"
         else:
             tours_info = "Знайшли кілька турів:\n"
-            for p in fprods:
+            for p in valid_tours:
                 pid = p.get("id","?")
                 pname = p.get("name","No name")
                 pprice = p.get("price",0)
                 tours_info += f"- {pname} (ID {pid}), ціна: {pprice}\n"
+
     if choice == "cost":
         text = (
             "Дата виїзду: 26 жовтня з Ужгорода та Мукачева.\n"
@@ -515,6 +544,7 @@ async def details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Вартість: 1900 грн (трансфер, квитки, страхування).\n\n"
             + tours_info
         )
+
     await typing_simulation(update, text)
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
     schedule_no_response_job(context, update.effective_chat.id)
@@ -525,8 +555,10 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
     user_id = str(update.effective_user.id)
     txt = update.message.text.lower().strip()
     cancel_no_response_job(context)
+    # fuzzy time question
     time_keys = ["коли виїзд","коли відправлення","час виїзду","коли автобус","коли вирушаємо"]
-    if any(k in txt for k in time_keys):
+    best, score = process.extractOne(txt, time_keys, scorer=fuzz.partial_ratio)
+    if score >= 70:
         ans = (
             "Виїзд о 6:00 з Ужгорода, о 6:30 з Мукачева, повертаємось орієнтовно о 20:00.\n"
             "Чи є ще запитання?"
@@ -535,19 +567,25 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ADDITIONAL_QUESTIONS
+
+    # fuzzy booking
     book_keys = ["бронювати","бронюй","купувати тур","давай бронювати","окей давай бронювати","окей бронюй тур"]
-    if any(k in txt for k in book_keys):
+    best_bk, score_bk = process.extractOne(txt, book_keys, scorer=fuzz.partial_ratio)
+    if score_bk >= 70:
         r = "Добре, переходимо до оформлення бронювання. Я надам вам реквізити для оплати."
         await typing_simulation(update, r)
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         return await close_deal_handler(update, context)
+
     no_more = ["немає","все зрозуміло","все ок","досить","спасибі","дякую"]
-    if any(k in txt for k in no_more):
+    best_nm, score_nm = process.extractOne(txt, no_more, scorer=fuzz.partial_ratio)
+    if score_nm >= 70:
         rr = "Як вам наша пропозиція в цілому? 🌟"
         await typing_simulation(update, rr)
         save_user_state(user_id, STAGE_IMPRESSION, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_IMPRESSION
+
     s = get_sentiment(txt)
     if s == "negative":
         fp = (
@@ -557,6 +595,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         fallback_text = await get_chatgpt_response(fp)
         await typing_simulation(update, fallback_text)
         return STAGE_ADDITIONAL_QUESTIONS
+
     i = analyze_intent(txt)
     if i == "unclear":
         prompt = (
@@ -566,6 +605,7 @@ async def additional_questions_handler(update: Update, context: ContextTypes.DEF
         fb = await get_chatgpt_response(prompt)
         await typing_simulation(update, fb)
         return STAGE_ADDITIONAL_QUESTIONS
+
     ans = "Гарне запитання! Якщо є ще щось, що вас цікавить, будь ласка, питайте.\n\nЧи є ще запитання?"
     await typing_simulation(update, ans)
     save_user_state(user_id, STAGE_ADDITIONAL_QUESTIONS, context.user_data)
@@ -578,7 +618,9 @@ async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     cancel_no_response_job(context)
     pos = ["добре","клас","цікаво","відмінно","супер","підходить","так"]
     neg = ["ні","не цікаво","дорого","завелика","надто"]
-    if any(k in txt for k in pos):
+    best_pos, score_pos = process.extractOne(txt, pos, scorer=fuzz.partial_ratio)
+    best_neg, score_neg = process.extractOne(txt, neg, scorer=fuzz.partial_ratio)
+    if score_pos >= 70:
         r = (
             "Чудово! 🎉 Давайте забронюємо місце для вас і вашої дитини, щоб забезпечити комфортний відпочинок. "
             "Для цього потрібно внести аванс у розмірі 30% та надіслати фото паспорта або іншого документу. "
@@ -589,7 +631,7 @@ async def impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         save_user_state(user_id, STAGE_CLOSE_DEAL, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CLOSE_DEAL
-    elif any(k in txt for k in neg):
+    elif score_neg >= 70:
         rr = "Шкода це чути. Якщо у вас залишилися питання або ви захочете розглянути інші варіанти, звертайтеся."
         await typing_simulation(update, rr)
         save_user_state(user_id, STAGE_END, context.user_data)
@@ -606,7 +648,8 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     txt = update.message.text.lower().strip()
     cancel_no_response_job(context)
     pos = ["приват","моно","оплачу","готов","готова","давайте"]
-    if any(k in txt for k in pos):
+    best_p, sc_p = process.extractOne(txt, pos, scorer=fuzz.partial_ratio)
+    if sc_p >= 70:
         r = (
             "Чудово! Ось реквізити для оплати:\n"
             "Картка: 0000 0000 0000 0000 (Family Place)\n\n"
@@ -617,7 +660,8 @@ async def close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_PAYMENT
     neg = ["ні","нет","не буду","не хочу"]
-    if any(k in txt for k in neg):
+    best_n, sc_n = process.extractOne(txt, neg, scorer=fuzz.partial_ratio)
+    if sc_n >= 70:
         r2 = "Зрозуміло. Буду рада допомогти, якщо передумаєте!"
         await typing_simulation(update, r2)
         save_user_state(user_id, STAGE_END, context.user_data)
@@ -632,7 +676,10 @@ async def payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     txt = update.message.text.lower().strip()
     cancel_no_response_job(context)
-    if any(k in txt for k in ["оплатив","відправив","скинув","готово"]):
+    # fuzzy "оплатил" etc
+    pay_words = ["оплатив","відправив","скинув","готово","оплатил","зробив оплату"]
+    best_pw, sc_pw = process.extractOne(txt, pay_words, scorer=fuzz.partial_ratio)
+    if sc_pw >= 70:
         r = (
             "Дякую! Тепер перевірю надходження. Як тільки все буде ок, я надішлю деталі поїздки і підтвердження бронювання!"
         )
@@ -703,6 +750,7 @@ async def run_bot():
     application_builder = Application.builder().token(BOT_TOKEN).request(req)
     global application
     application = application_builder.build()
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -717,12 +765,17 @@ async def run_bot():
             STAGE_CLOSE_DEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, close_deal_handler)],
             STAGE_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_handler)],
             STAGE_PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, payment_confirm_handler)],
-            STAGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: c.bot.send_message(chat_id=u.effective_chat.id, text="Дякую! Якщо виникнуть питання — /start."))],
+            STAGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND,
+                                       lambda u,c: c.bot.send_message(
+                                           chat_id=u.effective_chat.id,
+                                           text="Дякую! Якщо виникнуть питання — /start."
+                                       ))],
         },
         fallbacks=[CommandHandler('cancel', cancel_command)],
         allow_reentry=True
     )
     application.add_handler(conv_handler)
+
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
     await application.start()
