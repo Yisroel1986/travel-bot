@@ -24,7 +24,8 @@ from telegram.ext import (
     filters,
     ConversationHandler,
     ContextTypes,
-    CallbackContext
+    CallbackContext,
+    ApplicationBuilder
 )
 from telegram.request import HTTPXRequest
 
@@ -44,9 +45,6 @@ except:
 
 try:
     from transformers import pipeline
-    # Пример: меняем на любую другую модель
-    # sentiment_pipeline = pipeline("sentiment-analysis", model="nlptown/bert-base-multilingual-uncased-sentiment")
-    # Или Twitter Roberta
     sentiment_pipeline = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
 except:
     sentiment_pipeline = None
@@ -66,6 +64,9 @@ if openai and OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
 
 def is_bot_already_running():
+    """
+    Простейшая проверка, не запущен ли бот вторым процессом.
+    """
     current_process = psutil.Process()
     for process in psutil.process_iter(['pid', 'name', 'cmdline']):
         if (
@@ -84,7 +85,7 @@ def is_bot_already_running():
     STAGE_CAMP_PHONE,       # 1 - просим телефон для "Лапландія в Карпатах"
     STAGE_CAMP_NO_PHONE_QA, # 2 - клиент не дал телефон, идём в уточняющие вопросы по лагерю
     STAGE_CAMP_DETAILED,    # 3 - более детальный сценарий лагеря
-    STAGE_CAMP_END,         # 4 - завершаем
+    STAGE_CAMP_END,         # 4
 
     STAGE_ZOO_GREET,        # 5
     STAGE_ZOO_DEPARTURE,    # 6
@@ -100,7 +101,7 @@ def is_bot_already_running():
     STAGE_ZOO_END           # 16
 ) = range(17)
 
-NO_RESPONSE_DELAY_SECONDS = 6*3600
+NO_RESPONSE_DELAY_SECONDS = 6*3600  # 6 часов бездействия => напоминание
 
 app = Flask(__name__)
 application = None
@@ -156,6 +157,9 @@ def no_response_callback(context:CallbackContext):
     context.bot.send_message(chat_id=chat_id, text=text)
 
 def schedule_no_response_job(context:CallbackContext, chat_id:int):
+    """
+    Планируем джоб, который через NO_RESPONSE_DELAY_SECONDS отправит напоминание.
+    """
     jq = context.job_queue
     jobs = jq.get_jobs_by_name(f"noresp_{chat_id}")
     for j in jobs:
@@ -163,6 +167,9 @@ def schedule_no_response_job(context:CallbackContext, chat_id:int):
     jq.run_once(no_response_callback, NO_RESPONSE_DELAY_SECONDS, chat_id=chat_id, name=f"noresp_{chat_id}")
 
 def cancel_no_response_job(context:CallbackContext):
+    """
+    Отменяем напоминания, если пользователь ответил.
+    """
     jq = context.job_queue
     chat_id = context._chat_id if hasattr(context,'_chat_id') else None
     if chat_id:
@@ -174,8 +181,12 @@ def cancel_no_response_job(context:CallbackContext):
 # Typing simulation
 # -----------------------------
 async def typing_simulation(update:Update, text:str):
-    """Отправляет 'typing...' и затем сообщение с задержкой."""
+    """
+    Отправляет 'typing...' и затем сообщение с небольшой задержкой,
+    имитируя «набор».
+    """
     await update.effective_chat.send_action(ChatAction.TYPING)
+    # Задержка 2..4 секунд или чуть больше по длине текста
     await asyncio.sleep(min(4, max(2, len(text)/70)))
     await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
@@ -183,15 +194,18 @@ async def typing_simulation(update:Update, text:str):
 # Simple intent detection
 # -----------------------------
 def is_positive_response(txt:str)->bool:
-    arr = ["так","добре","да","ок","продовжуємо","розкажіть","готовий","готова","привіт","hello","зацікав"]
+    arr = ["так","добре","да","ок","продовжуємо","розкажіть","готовий","готова","привіт","hello","зацікав","yes","sure","ага"]
     return any(k in txt.lower() for k in arr)
 
 def is_negative_response(txt:str)->bool:
-    arr = ["не хочу","не можу","нет","ні","не буду","не зараз"]
+    arr = ["не хочу","не можу","нет","ні","не буду","не зараз","no","неа"]
     return any(k in txt.lower() for k in arr)
 
 def analyze_intent(txt:str)->str:
-    """Простейшая логика intent detection."""
+    """
+    Простая проверка ответа: positive / negative / unclear
+    Если у вас spaCy, можно использовать лемматизацию.
+    """
     if nlp_uk:
         doc = nlp_uk(txt)
         lemmas = [t.lemma_.lower() for t in doc]
@@ -209,6 +223,9 @@ def analyze_intent(txt:str)->str:
             return "unclear"
 
 def get_sentiment(txt:str)->str:
+    """
+    Если нужно анализ настроения, используем huggingface pipeline. 
+    """
     if sentiment_pipeline:
         res = sentiment_pipeline(txt)[0]
         lbl = res["label"].lower()
@@ -226,13 +243,15 @@ def get_sentiment(txt:str)->str:
 # GPT fallback
 # -----------------------------
 async def get_chatgpt_response(prompt:str)->str:
-    """Обращение к GPT-4 для fallback-ответов."""
+    """
+    Асинхронный вызов OpenAI ChatCompletion (gpt-4).
+    """
     if not openai or not OPENAI_API_KEY:
         return "Вибачте, функція GPT недоступна."
     try:
         resp = await asyncio.to_thread(
             openai.ChatCompletion.create,
-            model="gpt-4",  # Важно: gpt-4
+            model="gpt-4",
             messages=[{"role":"user","content":prompt}],
             max_tokens=400,
             temperature=0.7
@@ -252,7 +271,7 @@ async def start_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
 
     stg, dat = load_user_state(user_id)
     if stg is not None and dat is not None:
-        # user has conversation
+        # user has conversation in DB
         text = (
             "Ви маєте незавершену розмову. Бажаєте продовжити з того ж місця чи почати заново?\n"
             "Відповідайте: 'Продовжити' або 'Почати заново'."
@@ -262,7 +281,7 @@ async def start_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_SCENARIO_CHOICE
     else:
-        # new user
+        # New user
         txt = (
             "Вітаю! Дякую за інтерес до наших пропозицій. "
             "Скажіть, будь ласка, що вас цікавить: зимовий табір 'Лапландія в Карпатах' чи одноденний тур у зоопарк Ньїредьгаза? 😊"
@@ -281,7 +300,6 @@ async def scenario_choice_handler(update:Update, context:ContextTypes.DEFAULT_TY
     cancel_no_response_job(context)
 
     if any(k in txt for k in ["лапланд","карпат","табір","лагерь","camp"]):
-        # winter camp scenario
         context.user_data["scenario"] = "camp"
         text = (
             "Вітаю Вас! 😊 Дякую за Ваш інтерес до нашого зимового табору 'Лапландія в Карпатах'. "
@@ -293,8 +311,7 @@ async def scenario_choice_handler(update:Update, context:ContextTypes.DEFAULT_TY
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_PHONE
 
-    elif any(k in txt for k in ["зоопарк","ніредьгаза","nyire","леви","лев","одноден","мукач","ужгород"]):
-        # zoo scenario
+    elif any(k in txt for k in ["зоопарк","ніредьгаза","nyire","лев","одноден","мукач","ужгород"]):
         context.user_data["scenario"] = "zoo"
         text = (
             "Вітаю вас! 😊 Дякую за Ваш інтерес до одноденного туру в зоопарк Ньїредьгаза, Угорщина. "
@@ -308,7 +325,7 @@ async def scenario_choice_handler(update:Update, context:ContextTypes.DEFAULT_TY
     else:
         # fallback GPT
         prompt = (
-            "Клієнт написав: "+txt+"\n"
+            f"Клієнт написав: {txt}\n"
             "Нам потрібно визначити, интересуется ли он лагерем 'Лапландія' или туром 'зоопарк Ньїредьгаза'. "
             "Если непонятно, попроси уточнить."
         )
@@ -334,12 +351,11 @@ async def camp_phone_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             "Якщо бажаєте, можу коротко розповісти деталі табору 'Лапландія в Карпатах' прямо тут, у чаті?"
         )
         await typing_simulation(update, text)
-        # Здесь логика передачи номера менеджеру
+        # Здесь логика передачи номера в CRM или менеджеру
         save_user_state(user_id, STAGE_CAMP_DETAILED, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_DETAILED
     else:
-        # user not provided phone
         text = (
             "Розумію, що ви поки не хочете лишати номер. Я можу відповісти на ваші запитання тут. "
             "Дозвольте задати кілька уточнюючих питань, щоб підібрати кращий варіант для вашої дитини. Добре?"
@@ -359,6 +375,7 @@ async def camp_no_phone_qa_handler(update:Update, context:ContextTypes.DEFAULT_T
 
     intent = analyze_intent(txt)
     if intent == "positive":
+        # Переходим к уточняющим вопросам
         text = "З якого Ви міста? 🏙️"
         await typing_simulation(update, text)
         context.user_data["camp_questions"] = 1
@@ -366,24 +383,18 @@ async def camp_no_phone_qa_handler(update:Update, context:ContextTypes.DEFAULT_T
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_NO_PHONE_QA
     else:
-        # fallback or negative
         fallback = "Будь ласка, уточніть, чи можемо ми поговорити детальніше про табір?"
         await typing_simulation(update, fallback)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_NO_PHONE_QA
 
-# Теоретически здесь можно расширять логику вопросов-ответов о лагере
-
 # -----------------------------
 # CAMP: DETAILED
 # -----------------------------
 async def camp_detailed_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    """Если клиент уже дал телефон, но хочет коротко услышать детали."""
     txt = update.message.text.strip().lower()
     cancel_no_response_job(context)
 
-    # Простой пример ответа
-    # Можно расширять по презентации
     r = (
         "У таборі 'Лапландія в Карпатах' кожен день — це казка! Ваша дитина порине у зимову магію, "
         "де кожен день сповнений пригод. Ми підготували цікаву спортивну та творчу програму, "
@@ -392,22 +403,25 @@ async def camp_detailed_handler(update:Update, context:ContextTypes.DEFAULT_TYPE
         "Чи є у вас додаткові запитання поки що?"
     )
     await typing_simulation(update, r)
-    save_user_state(str(update.effective_user.id), STAGE_CAMP_END, context.user_data)
-    schedule_no_response_job(context, update.effective_chat.id)
-    return STAGE_CAMP_END
+
+    # Здесь можно, по желанию, не оставаться в сценарии. 
+    # Допустим, мы завершаем и освобождаем дальше fallback.
+    return ConversationHandler.END
 
 # -----------------------------
 # CAMP END
 # -----------------------------
 async def camp_end_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    # just finalize
-    pass
+    # Если хотите "завершить" — просто:
+    await update.message.reply_text(
+        "Дякую! Якщо виникнуть питання — /start. Гарного дня!"
+    )
+    return ConversationHandler.END
 
 # -----------------------------
 # ZOO: Greet
 # -----------------------------
 async def zoo_greet_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
     cancel_no_response_job(context)
 
@@ -415,7 +429,7 @@ async def zoo_greet_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     if intent == "positive":
         text = "Звідки вам зручніше виїжджати: з Ужгорода чи Мукачева? 🚌"
         await typing_simulation(update, text)
-        save_user_state(user_id, STAGE_ZOO_DEPARTURE, context.user_data)
+        save_user_state(str(update.effective_user.id), STAGE_ZOO_DEPARTURE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_DEPARTURE
     elif intent == "negative":
@@ -424,12 +438,13 @@ async def zoo_greet_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             "Це займе буквально хвилину!"
         )
         await typing_simulation(update, msg)
-        save_user_state(user_id, STAGE_ZOO_DETAILS, context.user_data)
+        save_user_state(str(update.effective_user.id), STAGE_ZOO_DETAILS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_DETAILS
     else:
+        # GPT fallback
         prompt = (
-            "Клієнт написав: " + txt + "\n"
+            f"Клієнт написав: {txt}\n"
             "В рамках сценарію тура (зоопарк), якщо незрозуміло, попроси уточнити."
         )
         fallback = await get_chatgpt_response(prompt)
@@ -437,14 +452,13 @@ async def zoo_greet_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
         return STAGE_ZOO_GREET
 
 async def zoo_departure_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
     cancel_no_response_job(context)
 
     context.user_data["departure"] = txt
     r = "Для кого ви розглядаєте цю поїздку? Чи плануєте їхати разом із дитиною?"
     await typing_simulation(update, r)
-    save_user_state(user_id, STAGE_ZOO_TRAVEL_PARTY, context.user_data)
+    save_user_state(str(update.effective_user.id), STAGE_ZOO_TRAVEL_PARTY, context.user_data)
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_ZOO_TRAVEL_PARTY
 
@@ -469,7 +483,7 @@ async def zoo_travel_party_handler(update:Update, context:ContextTypes.DEFAULT_T
 async def zoo_child_age_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip()
     cancel_no_response_job(context)
-    # Просто продолжаем
+    # Просто продолжим
     r = "Що вас цікавить найбільше: деталі туру, вартість чи бронювання місця? 😊"
     await typing_simulation(update, r)
     save_user_state(str(update.effective_user.id), STAGE_ZOO_CHOICE, context.user_data)
@@ -517,8 +531,8 @@ async def zoo_details_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             "Дата виїзду: 26 жовтня з Ужгорода та Мукачева.\n"
             "Це цілий день, і ввечері ви будете вдома.\n"
             "Вартість туру: 1900 грн з особи (включає трансфер, квитки, страхування).\n\n"
-            "Уявіть, як ваша дитина в захваті від зустрічі з левами, слонами і жирафами, а ви можете "
-            "насолодитися спокійним часом без зайвих клопотів!\n"
+            "Уявіть, як ваша дитина в захваті від зустрічі з левами, слонами і жирафами, а ви "
+            "спокійно насолоджуєтесь поїздкою!\n"
             "Чи є у вас додаткові запитання?"
         )
     else:
@@ -607,7 +621,7 @@ async def zoo_payment_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.lower()
     cancel_no_response_job(context)
 
-    if any(k in txt for k in ["оплатив","відправив","готово","скинув"]):
+    if any(k in txt for k in ["оплатив","відправив","готово","скинув","чек"]):
         r = "Дякую! Перевірю надходження і відправлю деталі!"
         await typing_simulation(update, r)
         save_user_state(str(update.effective_user.id), STAGE_ZOO_PAYMENT_CONFIRM, context.user_data)
@@ -627,8 +641,9 @@ async def zoo_payment_confirm_handler(update:Update, context:ContextTypes.DEFAUL
         "Скоро надішлю повну інформацію. Якщо будуть питання — звертайтесь!"
     )
     await typing_simulation(update, r)
-    save_user_state(str(update.effective_user.id), STAGE_ZOO_END, context.user_data)
-    return STAGE_ZOO_END
+    # Далее завершаем:
+    return ConversationHandler.END
+
 
 # cancel
 async def cancel_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
@@ -638,12 +653,27 @@ async def cancel_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
     t = "Добре, завершуємо розмову. Якщо виникнуть питання, звертайтесь знову!"
     await typing_simulation(update, t)
     uid = str(update.effective_user.id)
-    save_user_state(uid, STAGE_ZOO_END, context.user_data)
     return ConversationHandler.END
 
+
 # -----------------------------
-# WEBHOOKS
+# GLOBAL FALLBACK (GPT) HANDLER
 # -----------------------------
+async def global_fallback_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+    """
+    Глобальный fallback: если ConversationHandler не перехватил, 
+    вызываем GPT-ответ.
+    """
+    user_text = update.message.text.strip()
+    prompt = (
+        "Пользователь (украинский/русский). Текст:\n"
+        f"{user_text}\n\n"
+        "Ты — 'Олена', эмпатичный бот для турфирмы. Ответь в дружелюбном стиле."
+    )
+    gpt_answer = await get_chatgpt_response(prompt)
+    await update.message.reply_text(gpt_answer)
+
+
 @app.route('/')
 def index():
     return "Сервер працює! Бот активний."
@@ -676,7 +706,6 @@ async def run_bot():
     logger.info("Starting bot...")
 
     req = HTTPXRequest(connect_timeout=20, read_timeout=40)
-    from telegram.ext import ApplicationBuilder
     global application
     builder = ApplicationBuilder().token(BOT_TOKEN).request(req)
     application = builder.build()
@@ -704,12 +733,19 @@ async def run_bot():
             STAGE_ZOO_CLOSE_DEAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, zoo_close_deal_handler)],
             STAGE_ZOO_PAYMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, zoo_payment_handler)],
             STAGE_ZOO_PAYMENT_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, zoo_payment_confirm_handler)],
-            STAGE_ZOO_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: c.bot.send_message(u.effective_chat.id,"Дякую! Якщо виникнуть питання — /start."))]
+            # Если в STAGE_ZOO_END всё ещё обрабатываем — выходим end_handler
+            STAGE_ZOO_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, lambda u,c: c.bot.send_message(u.effective_chat.id,"Дякую! Якщо виникнуть питання — /start."))],
         },
         fallbacks=[CommandHandler('cancel', cancel_command)],
         allow_reentry=True
     )
-    application.add_handler(conv_handler)
+    application.add_handler(conv_handler, group=0)
+
+    # Глобальный fallback – сработает, если выше хендлеры не поймали
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, global_fallback_handler),
+        group=1
+    )
 
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
