@@ -7,30 +7,11 @@ from scenario import ScenarioData
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 class GPTLogic:
-    """
-    Класс для fallback-логики GPT.
-    Если сообщение не перехватили сценарии (ConversationHandler), 
-    мы вызываем этот fallback.
-    """
-
-    def __init__(self):
-        # Если нужно — можно подгружать сценарии, FAQ, но 
-        # в данном случае он лишь fallback
-        self.faq_data = ScenarioData.get_faq_common()
-
     def get_fallback_response(self, user_text: str) -> str:
-        """
-        GPT fallback. Если ConversationHandler не перехватил, 
-        генерируем ответ в стиле 'Олена'.
-        """
         system_prompt = (
-            "Ты — чат-бот-женщина по имени Олена, дружелюбная и эмпатичная, "
-            "работаешь на украинском/русском языках, помогаешь продавать туры и детские лагеря. "
-            "Если нет ответа в готовых сценариях, отвечай тепло и вежливо, добавляй уместные эмодзи."
+            "Ты — чат-бот-женщина по имени Олена, ... (стиль, эмпатия)..."
         )
-
         if not openai.api_key:
-            # Если ключа нет, вернём fallback текст из scenario.py
             return ScenarioData.get_fallback_text()
 
         try:
