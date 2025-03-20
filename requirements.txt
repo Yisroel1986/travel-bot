@@ -48,3 +48,11 @@ spacy==3.8.4
 transformers==4.31.0
 python-Levenshtein==0.21.0
 dateparser==1.1.8
+langchain==0.1.0
+loguru==0.7.2
+
+# Добавлено для асинхронной работы с SQLite
+aiosqlite==0.17.0
+
+# При необходимости для полного функционала transformers:
+# torch==2.0.1

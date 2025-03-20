@@ -1,16 +1,28 @@
 import os
-import logging
 import sys
-import psutil
-import sqlite3
 import json
-from datetime import datetime
+import psutil
 import asyncio
 import threading
+from datetime import datetime
+
+import aiosqlite  # Асинхронная работа с SQLite
 import requests
 
 from dotenv import load_dotenv
 from flask import Flask, request
+
+# -----------------------------
+# Замена logging -> loguru
+# -----------------------------
+from loguru import logger
+logger.add(
+    "bot_logs.log",
+    format="{time} {level} {message}",
+    level="INFO",
+    rotation="10 MB",
+    compression="zip",
+)
 
 from telegram import (
     Update,
@@ -30,39 +42,47 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 
 # -----------------------------
-# Попытка подключить spaCy, openai, huggingface
+# spaCy, huggingface
 # -----------------------------
 try:
     import spacy
     nlp_uk = spacy.load("uk_core_news_sm")  # украинская модель spaCy
-except:
+    logger.info("spaCy (uk_core_news_sm) loaded successfully.")
+except Exception as e:
+    logger.warning(f"spaCy not loaded: {e}")
     nlp_uk = None
-
-try:
-    import openai
-except:
-    openai = None
 
 try:
     from transformers import pipeline
     sentiment_pipeline = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment-latest")
-except:
+    logger.info("HuggingFace sentiment pipeline loaded.")
+except Exception as e:
+    logger.warning(f"Sentiment pipeline not loaded: {e}")
     sentiment_pipeline = None
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# -----------------------------
+# LangChain + OpenAI
+# -----------------------------
+try:
+    import openai
+    from langchain.llms import OpenAI
+    from langchain.prompts import PromptTemplate
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if openai_api_key:
+        openai.api_key = openai_api_key
+        llm = OpenAI(model_name="gpt-4", openai_api_key=openai_api_key)
+        logger.info("LangChain/OpenAI loaded successfully with GPT-4.")
+    else:
+        llm = None
+        logger.warning("No OPENAI_API_KEY found.")
+except Exception as e:
+    logger.warning(f"LangChain/OpenAI not available: {e}")
+    llm = None
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-CRM_API_KEY = os.getenv("CRM_API_KEY")
-CRM_API_URL = os.getenv("CRM_API_URL", "")
 WEBHOOK_URL = os.getenv("RENDER_EXTERNAL_URL", "")
-
-# Если есть ключ openai, используем
-if openai and OPENAI_API_KEY:
-    openai.api_key = OPENAI_API_KEY
 
 # -----------------------------
 # Проверка, не запущен ли бот вторым процессом
@@ -79,10 +99,8 @@ def is_bot_already_running():
     return False
 
 # -----------------------------
-# СЦЕНАРНЫЕ ТЕКСТЫ (вместо scenario.py)
+# Сценарные тексты (встроенные)
 # -----------------------------
-
-# ---- Лагерь "Лапландія в Карпатах"
 LAPLANDIA_INTRO = (
     "Вітаю Вас! 😊 Дякую за Ваш інтерес до нашого зимового табору 'Лапландія в Карпатах'. "
     "Щоб надати Вам детальну інформацію та відповісти на всі Ваші запитання, "
@@ -108,7 +126,6 @@ LAPLANDIA_NO_PHONE = (
     "Дозвольте задати кілька уточнюючих питань, щоб підібрати кращий варіант для вашої дитини. Добре?"
 )
 
-# ---- Зоопарк Ньїредьгаза
 ZOO_INTRO = (
     "Вітаю вас! 😊 Дякую за Ваш інтерес до одноденного туру в зоопарк Ньїредьгаза, Угорщина. "
     "Це чудова можливість подарувати вашій дитині та вам незабутній день серед екзотичних тварин! "
@@ -127,7 +144,6 @@ ZOO_PRICE_SCENARIO = (
     "Діти будуть у захваті, а ви зможете відпочити, насолоджуючись природою. 🎉"
 )
 
-# ---- Общий fallback
 FALLBACK_TEXT = (
     "Вибачте, я поки що не зрозуміла вашого запитання. Я можу розповісти про зимовий табір 'Лапландія в Карпатах' "
     "або одноденний тур до зоопарку Ньїредьгаза. Будь ласка, уточніть, що саме вас цікавить. 😊"
@@ -163,44 +179,52 @@ app = Flask(__name__)
 application = None
 
 # ============================
-# DB init / load / save
+# DB init
 # ============================
-def init_db():
-    conn = sqlite3.connect("bot_database.db")
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS conversation_state (
-            user_id TEXT PRIMARY KEY,
-            current_stage INTEGER,
-            user_data TEXT,
-            last_interaction TIMESTAMP
-        )
-    """)
-    conn.commit()
-    conn.close()
+async def init_db():
+    async with aiosqlite.connect("bot_database.db") as db:
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS conversation_state (
+                user_id TEXT PRIMARY KEY,
+                current_stage INTEGER,
+                user_data TEXT,
+                last_interaction TIMESTAMP
+            )
+        """)
+        await db.commit()
 
-def load_user_state(user_id:str):
-    conn = sqlite3.connect("bot_database.db")
-    c = conn.cursor()
-    c.execute("SELECT current_stage,user_data FROM conversation_state WHERE user_id=?",(user_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return row[0], row[1]
-    return None,None
+async def load_user_state(user_id: str):
+    """
+    Асинхронное чтение из базы.
+    """
+    try:
+        async with aiosqlite.connect("bot_database.db") as db:
+            cursor = await db.execute("SELECT current_stage, user_data FROM conversation_state WHERE user_id=?",(user_id,))
+            row = await cursor.fetchone()
+            if row:
+                return row[0], row[1]
+            return None, None
+    except Exception as e:
+        logger.error(f"load_user_state error: {e}")
+        return None, None
 
-def save_user_state(user_id:str, stage:int, user_data:dict):
-    conn = sqlite3.connect("bot_database.db")
-    c = conn.cursor()
-    ud_json = json.dumps(user_data, ensure_ascii=False)
-    now = datetime.now().isoformat()
-    c.execute("""
-        INSERT OR REPLACE INTO conversation_state 
-        (user_id, current_stage, user_data, last_interaction)
-        VALUES (?,?,?,?)
-    """,(user_id, stage, ud_json, now))
-    conn.commit()
-    conn.close()
+async def save_user_state(user_id: str, stage: int, user_data: dict):
+    """
+    Асинхронное сохранение state в SQLite.
+    """
+    try:
+        ud_json = json.dumps(user_data, ensure_ascii=False)
+        now = datetime.now().isoformat()
+        async with aiosqlite.connect("bot_database.db") as db:
+            await db.execute(
+                """INSERT OR REPLACE INTO conversation_state 
+                   (user_id, current_stage, user_data, last_interaction)
+                   VALUES (?,?,?,?)""",
+                (user_id, stage, ud_json, now)
+            )
+            await db.commit()
+    except Exception as e:
+        logger.error(f"save_user_state error: {e}")
 
 # ============================
 # No response job
@@ -231,83 +255,86 @@ def cancel_no_response_job(context:CallbackContext):
 # ============================
 # Typing simulation
 # ============================
-async def typing_simulation(update:Update, text:str):
+async def typing_simulation(update: Update, text: str):
     await update.effective_chat.send_action(ChatAction.TYPING)
     await asyncio.sleep(min(4, max(2, len(text)/70)))
     await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
 
 # ============================
-# Intent detection
+# spaCy-based intent detection
 # ============================
-def is_positive_response(txt:str)->bool:
-    arr = ["так","добре","да","ок","продовжуємо","розкажіть","готовий","готова","привіт","hello","yes","зацікав","sure"]
-    return any(k in txt.lower() for k in arr)
-
-def is_negative_response(txt:str)->bool:
-    arr = ["не хочу","не можу","нет","ні","не буду","не зараз","no"]
-    return any(k in txt.lower() for k in arr)
-
-def analyze_intent(txt:str)->str:
-    if nlp_uk:
+def analyze_intent(txt: str, lang: str = "uk") -> str:
+    """
+    Анализирует намерение пользователя с помощью `spaCy`.
+    """
+    if lang == "uk" and nlp_uk:
         doc = nlp_uk(txt)
         lemmas = [t.lemma_.lower() for t in doc]
-        if any(k in lemmas for k in ["так","ок","добре","готовий"]):
+        positive_words = {"так", "ок", "добре", "готовий", "хочу", "зацікавлений"}
+        negative_words = {"не", "ні", "нет", "не хочу", "не буду", "не цікавить"}
+
+        if any(k in lemmas for k in positive_words):
             return "positive"
-        if any(k in lemmas for k in ["не","ні","нет","небуду"]):
+        if any(k in lemmas for k in negative_words):
             return "negative"
         return "unclear"
     else:
-        if is_positive_response(txt):
+        # Fallback, если spaCy не инициализирована
+        txt_lower = txt.lower()
+        if any(k in txt_lower for k in ["так","ок","добре","готовий","хочу"]):
             return "positive"
-        elif is_negative_response(txt):
+        if any(k in txt_lower for k in ["не","ні","нет","не хочу","не буду"]):
             return "negative"
-        else:
-            return "unclear"
+        return "unclear"
 
 # ============================
-# GPT fallback
+# LangChain GPT fallback
 # ============================
-async def gpt_fallback_response(user_text:str)->str:
-    if not openai or not OPENAI_API_KEY:
+prompt_template = None
+if llm:
+    prompt_template = PromptTemplate(
+        input_variables=["user_text"],
+        template=(
+            "Ты — бот по продаже туров и лагерей. "
+            "Отвечай только по теме туров и детских лагерей. Если вопрос не связан, напиши: "
+            "'Извините, я могу помочь только по теме туров.'\n\n"
+            "Пользователь: {user_text}\nОтвет:"
+        )
+    )
+
+async def gpt_fallback_response(user_text: str) -> str:
+    """
+    Запрос к GPT через LangChain, с ограниченным промптом.
+    """
+    if not llm or not prompt_template:
         return "Вибачте, функція GPT недоступна."
+
+    formatted_prompt = prompt_template.format(user_text=user_text)
     try:
-        system_prompt = (
-            "Ты — чат-бот-женщина по имени Олена, дружелюбная, эмпатичная, "
-            "работаешь на украинском/русском для продажи туров и детских лагерей. "
-            "Если не находишь точного ответа в сценарии — отвечай вежливо и тепло."
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text}
-        ]
-        resp = await asyncio.to_thread(
-            openai.ChatCompletion.create,
-            model="gpt-4",
-            messages=messages,
-            max_tokens=300,
-            temperature=0.7
-        )
-        return resp.choices[0].message.content.strip()
+        response = await asyncio.to_thread(llm, formatted_prompt)
+        return response.strip()
     except Exception as e:
-        logger.error(f"GPT error: {e}")
-        return FALLBACK_TEXT
+        logger.error(f"GPT fallback error: {e}")
+        return "Извините, я могу помочь только по теме туров."
 
 # ============================
-# START Handler
+# Conversation Handlers
 # ============================
-async def start_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+
+# ---- START
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
-    init_db()
+    await init_db()
     cancel_no_response_job(context)
 
-    stage, data = load_user_state(user_id)
-    if stage is not None:
+    stg, _ = await load_user_state(user_id)
+    if stg is not None:
         text = (
             "Ви маєте незавершену розмову. Бажаєте продовжити з того ж місця чи почати заново?\n"
             "Відповідайте: 'Продовжити' або 'Почати заново'."
         )
         await typing_simulation(update, text)
-        save_user_state(user_id, STAGE_SCENARIO_CHOICE, context.user_data)
+        await save_user_state(user_id, STAGE_SCENARIO_CHOICE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_SCENARIO_CHOICE
     else:
@@ -317,89 +344,68 @@ async def start_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
             "чи одноденний тур у зоопарк Ньїредьгаза? 😊"
         )
         await typing_simulation(update, txt)
-        save_user_state(user_id, STAGE_SCENARIO_CHOICE, context.user_data)
+        await save_user_state(user_id, STAGE_SCENARIO_CHOICE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_SCENARIO_CHOICE
 
-# ============================
-# SCENARIO CHOICE
-# ============================
-async def scenario_choice_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- SCENARIO CHOICE
+async def scenario_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
     txt = update.message.text.lower().strip()
 
-    # Лагерь
     if any(k in txt for k in ["лапланд","карпат","табір","лагерь","camp"]):
         context.user_data["scenario"] = "camp"
-        text = LAPLANDIA_INTRO
-        await typing_simulation(update, text)
-        save_user_state(user_id, STAGE_CAMP_PHONE, context.user_data)
+        await typing_simulation(update, LAPLANDIA_INTRO)
+        await save_user_state(user_id, STAGE_CAMP_PHONE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_PHONE
 
-    # Зоопарк
     elif any(k in txt for k in ["зоопарк","ніредьгаза","nyire","лев","одноден","мукач","ужгород"]):
         context.user_data["scenario"] = "zoo"
-        text = ZOO_INTRO
-        await typing_simulation(update, text)
-        save_user_state(user_id, STAGE_ZOO_GREET, context.user_data)
+        await typing_simulation(update, ZOO_INTRO)
+        await save_user_state(user_id, STAGE_ZOO_GREET, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_GREET
 
     else:
         # GPT fallback
-        prompt = (
-            f"Пользователь написал: {txt}\n"
-            "Нужно определить, интересует ли лагерь 'Лапландія' или 'Зоопарк Ньїредьгаза'. "
-            "Если непонятно, попроси уточнить."
-        )
-        gpt_text = await gpt_fallback_response(prompt)
-        await typing_simulation(update, gpt_text)
-        save_user_state(user_id, STAGE_SCENARIO_CHOICE, context.user_data)
+        fallback_answer = await gpt_fallback_response(txt)
+        await typing_simulation(update, fallback_answer)
+        await save_user_state(user_id, STAGE_SCENARIO_CHOICE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_SCENARIO_CHOICE
 
-# ============================
-# CAMP: PHONE
-# ============================
-async def camp_phone_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- CAMP: PHONE
+async def camp_phone_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
 
     phone_candidate = txt.replace(" ","").replace("-","")
     if phone_candidate.startswith("+") or phone_candidate.isdigit():
-        # пользователь дал телефон
-        r = LAPLANDIA_IF_PHONE
-        await typing_simulation(update, r)
-        # "Передаём" телефон менеджеру
-        save_user_state(user_id, STAGE_CAMP_DETAILED, context.user_data)
+        await typing_simulation(update, LAPLANDIA_IF_PHONE)
+        await save_user_state(user_id, STAGE_CAMP_DETAILED, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_DETAILED
     else:
-        # не дал телефон
-        r = LAPLANDIA_NO_PHONE
-        await typing_simulation(update, r)
-        save_user_state(user_id, STAGE_CAMP_NO_PHONE_QA, context.user_data)
+        await typing_simulation(update, LAPLANDIA_NO_PHONE)
+        await save_user_state(user_id, STAGE_CAMP_NO_PHONE_QA, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_NO_PHONE_QA
 
-# ============================
-# CAMP: NO PHONE Q/A
-# ============================
-async def camp_no_phone_qa_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- CAMP: NO PHONE QA
+async def camp_no_phone_qa_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
 
-    intent = analyze_intent(txt)
+    intent = analyze_intent(txt, "uk")
     if intent == "positive":
-        # задаём уточняющие вопросы
-        r = "З якого Ви міста? 🏙️"
-        await typing_simulation(update, r)
+        msg = "З якого Ви міста? 🏙️"
+        await typing_simulation(update, msg)
         context.user_data["camp_questions"] = 1
-        save_user_state(user_id, STAGE_CAMP_NO_PHONE_QA, context.user_data)
+        await save_user_state(user_id, STAGE_CAMP_NO_PHONE_QA, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_NO_PHONE_QA
     else:
@@ -408,59 +414,48 @@ async def camp_no_phone_qa_handler(update:Update, context:ContextTypes.DEFAULT_T
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_NO_PHONE_QA
 
-# ============================
-# CAMP: DETAILED
-# ============================
-async def camp_detailed_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- CAMP: DETAILED
+async def camp_detailed_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
 
-    r = LAPLANDIA_BRIEF
-    await typing_simulation(update, r)
-    save_user_state(user_id, STAGE_CAMP_END, context.user_data)
+    await typing_simulation(update, LAPLANDIA_BRIEF)
+    await save_user_state(user_id, STAGE_CAMP_END, context.user_data)
     return STAGE_CAMP_END
 
-# ============================
-# CAMP: END
-# ============================
-async def camp_end_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- CAMP: END
+async def camp_end_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Дякую! Якщо виникнуть питання — /start. Гарного дня!")
     return ConversationHandler.END
 
-# ============================
-# ZOO: Greet
-# ============================
-async def zoo_greet_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- ZOO: Greet
+async def zoo_greet_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
 
-    intent = analyze_intent(txt)
+    intent = analyze_intent(txt, "uk")
     if intent == "positive":
-        r = "Звідки вам зручніше виїжджати: з Ужгорода чи Мукачева? 🚌"
-        await typing_simulation(update, r)
-        save_user_state(user_id, STAGE_ZOO_DEPARTURE, context.user_data)
+        msg = "Звідки вам зручніше виїжджати: з Ужгорода чи Мукачева? 🚌"
+        await typing_simulation(update, msg)
+        await save_user_state(user_id, STAGE_ZOO_DEPARTURE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_DEPARTURE
     elif intent == "negative":
-        msg = (
+        fallback_msg = (
             "Я можу коротко розповісти про наш одноденний тур, якщо вам незручно відповідати на питання. "
             "Це займе буквально хвилину!"
         )
-        await typing_simulation(update, msg)
-        save_user_state(user_id, STAGE_ZOO_DETAILS, context.user_data)
+        await typing_simulation(update, fallback_msg)
+        await save_user_state(user_id, STAGE_ZOO_DETAILS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_DETAILS
     else:
-        prompt = (
-            f"Клієнт написав: {txt}\n"
-            "Якщо незрозуміло, попроси уточнити (сценарій зоопарк)."
-        )
-        fallback = await gpt_fallback_response(prompt)
-        await typing_simulation(update, fallback)
+        gpt_text = await gpt_fallback_response(txt)
+        await typing_simulation(update, gpt_text)
         return STAGE_ZOO_GREET
 
-async def zoo_departure_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_departure_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
@@ -468,45 +463,49 @@ async def zoo_departure_handler(update:Update, context:ContextTypes.DEFAULT_TYPE
     context.user_data["departure"] = txt
     r = "Для кого ви розглядаєте цю поїздку? Чи плануєте їхати разом із дитиною?"
     await typing_simulation(update, r)
-    save_user_state(user_id, STAGE_ZOO_TRAVEL_PARTY, context.user_data)
+    await save_user_state(user_id, STAGE_ZOO_TRAVEL_PARTY, context.user_data)
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_ZOO_TRAVEL_PARTY
 
-async def zoo_travel_party_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_travel_party_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     txt = update.message.text.lower().strip()
 
     if "дит" in txt:
+        context.user_data["travel_party"] = "child"
         await typing_simulation(update, "Скільки років вашій дитині?")
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CHILD_AGE, context.user_data)
+        await save_user_state(str(update.effective_user.id), STAGE_ZOO_CHILD_AGE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CHILD_AGE
     else:
+        context.user_data["travel_party"] = "no_child"
         r = "Що вас цікавить найбільше: деталі туру, вартість чи бронювання місця? 😊"
         await typing_simulation(update, r)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CHOICE, context.user_data)
+        await save_user_state(str(update.effective_user.id), STAGE_ZOO_CHOICE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CHOICE
 
-async def zoo_child_age_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_child_age_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
+    user_id = str(update.effective_user.id)
     r = "Що вас цікавить найбільше: деталі туру, вартість чи бронювання місця? 😊"
     await typing_simulation(update, r)
-    save_user_state(str(update.effective_user.id), STAGE_ZOO_CHOICE, context.user_data)
+    await save_user_state(user_id, STAGE_ZOO_CHOICE, context.user_data)
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_ZOO_CHOICE
 
-async def zoo_choice_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_choice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
+    user_id = str(update.effective_user.id)
     txt = update.message.text.lower().strip()
 
     if "детал" in txt:
         context.user_data["choice"] = "details"
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_DETAILS, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_DETAILS, context.user_data)
         return await zoo_details_handler(update, context)
     elif "вартість" in txt or "ціна" in txt:
         context.user_data["choice"] = "cost"
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_DETAILS, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_DETAILS, context.user_data)
         return await zoo_details_handler(update, context)
     elif "брон" in txt:
         context.user_data["choice"] = "booking"
@@ -517,19 +516,19 @@ async def zoo_choice_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
             "Вам зручніше оплатити через ПриватБанк чи MonoBank?"
         )
         await typing_simulation(update, r)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CLOSE_DEAL, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_CLOSE_DEAL, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CLOSE_DEAL
     else:
         resp = "Будь ласка, уточніть: вас цікавлять деталі туру, вартість чи бронювання місця?"
         await typing_simulation(update, resp)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CHOICE, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_CHOICE, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CHOICE
 
-async def zoo_details_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_details_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
-    txt = update.message.text.lower()
+    user_id = str(update.effective_user.id)
     choice = context.user_data.get("choice","details")
 
     if choice == "cost":
@@ -545,54 +544,57 @@ async def zoo_details_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
         text = ZOO_DETAILS
 
     await typing_simulation(update, text)
-    save_user_state(str(update.effective_user.id), STAGE_ZOO_QUESTIONS, context.user_data)
+    await save_user_state(user_id, STAGE_ZOO_QUESTIONS, context.user_data)
     schedule_no_response_job(context, update.effective_chat.id)
     return STAGE_ZOO_QUESTIONS
 
-async def zoo_questions_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_questions_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
+    user_id = str(update.effective_user.id)
     txt = update.message.text.lower()
 
     if "брон" in txt:
         r = "Чудово, тоді переходимо до оформлення бронювання. Я надішлю реквізити для оплати!"
         await typing_simulation(update, r)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CLOSE_DEAL, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_CLOSE_DEAL, context.user_data)
         return STAGE_ZOO_CLOSE_DEAL
     else:
         msg = "Як вам наша пропозиція в цілому? 🌟"
         await typing_simulation(update, msg)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_IMPRESSION, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_IMPRESSION, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_IMPRESSION
 
-async def zoo_impression_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_impression_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
+    user_id = str(update.effective_user.id)
     txt = update.message.text.lower()
 
-    if is_positive_response(txt):
+    if "так" in txt or "ок" in txt or "добре" in txt or "готов" in txt or "зацікав" in txt:
         r = (
             "Чудово! 🎉 Давайте забронюємо місце. "
             "Потрібно внести аванс 30% і надіслати фото паспорта. "
             "Вам зручніше оплатити через ПриватБанк чи MonoBank?"
         )
         await typing_simulation(update, r)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CLOSE_DEAL, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_CLOSE_DEAL, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CLOSE_DEAL
-    elif is_negative_response(txt):
+    elif "ні" in txt or "не" in txt:
         rr = "Шкода це чути. Якщо будуть питання — я завжди тут!"
         await typing_simulation(update, rr)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_END, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_END, context.user_data)
         return STAGE_ZOO_END
     else:
         fallback = "Дякую за думку! Чи готові ви до бронювання?"
         await typing_simulation(update, fallback)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CLOSE_DEAL, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_CLOSE_DEAL, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CLOSE_DEAL
 
-async def zoo_close_deal_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_close_deal_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
+    user_id = str(update.effective_user.id)
     txt = update.message.text.lower()
 
     if any(k in txt for k in ["приват","моно","оплачу","готов","давайте","скинь","реквизит"]):
@@ -602,39 +604,40 @@ async def zoo_close_deal_handler(update:Update, context:ContextTypes.DEFAULT_TYP
             "Як оплатите — надішліть, будь ласка, скрін. Після цього я відправлю програму і підтвердження бронювання!"
         )
         await typing_simulation(update, r)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_PAYMENT, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_PAYMENT, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_PAYMENT
-    elif is_negative_response(txt):
+    elif any(k in txt for k in ["ні","нет","не"]):
         r2 = "Зрозуміло. Буду рада допомогти, якщо передумаєте!"
         await typing_simulation(update, r2)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_END, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_END, context.user_data)
         return STAGE_ZOO_END
     else:
         r3 = "Ви готові завершити оформлення? Вам зручніше оплатити через ПриватБанк чи MonoBank?"
         await typing_simulation(update, r3)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_CLOSE_DEAL, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_CLOSE_DEAL, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_CLOSE_DEAL
 
-async def zoo_payment_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
+    user_id = str(update.effective_user.id)
     txt = update.message.text.lower()
 
     if any(k in txt for k in ["оплатив","відправив","готово","скинув","чек"]):
         r = "Дякую! Перевірю надходження і відправлю деталі!"
         await typing_simulation(update, r)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_PAYMENT_CONFIRM, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_PAYMENT_CONFIRM, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_PAYMENT_CONFIRM
     else:
         rr = "Якщо виникли питання з оплатою — пишіть, я допоможу."
         await typing_simulation(update, rr)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_PAYMENT, context.user_data)
+        await save_user_state(user_id, STAGE_ZOO_PAYMENT, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_ZOO_PAYMENT
 
-async def zoo_payment_confirm_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
+async def zoo_payment_confirm_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     r = (
         "Дякую за бронювання! Ваше місце офіційно заброньоване. "
@@ -643,27 +646,19 @@ async def zoo_payment_confirm_handler(update:Update, context:ContextTypes.DEFAUL
     await typing_simulation(update, r)
     return ConversationHandler.END
 
-# ============================
-# /cancel
-# ============================
-async def cancel_command(update:Update, context:ContextTypes.DEFAULT_TYPE):
+# ---- /cancel
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     logger.info("User canceled conversation")
     t = "Добре, завершуємо розмову. Якщо виникнуть питання, звертайтесь знову!"
     await typing_simulation(update, t)
     return ConversationHandler.END
 
-# ============================
-# Глобальный fallback
-# ============================
-async def global_fallback_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
-    """
-    Сюда попадаем, если ConversationHandler не забрал сообщение
-    (т.е. никакой стейт не подошёл).
-    """
+# ---- Глобальный fallback
+async def global_fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text.strip()
-    gpt_text = await gpt_fallback_response(user_text)
-    await typing_simulation(update, gpt_text)
+    fallback_answer = await gpt_fallback_response(user_text)
+    await typing_simulation(update, fallback_answer)
 
 # ============================
 # Flask endpoints
@@ -688,10 +683,10 @@ def webhook():
             logger.error("No event loop to process update.")
     return "OK"
 
-async def setup_webhook(url:str, app_ref):
+async def setup_webhook(url: str, app_ref):
     wh_url = f"{url}/webhook"
     await app_ref.bot.set_webhook(wh_url)
-    logger.info("Webhook set to %s", wh_url)
+    logger.info(f"Webhook set to {wh_url}")
 
 async def run_bot():
     if is_bot_already_running():
@@ -704,7 +699,9 @@ async def run_bot():
     builder = ApplicationBuilder().token(BOT_TOKEN).request(req)
     application = builder.build()
 
-    # ConversationHandler
+    # Инициализация БД (async)
+    await init_db()
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start_command)],
         states={
@@ -760,8 +757,7 @@ async def run_bot():
             ],
             STAGE_ZOO_END: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND,
-                               lambda u,c: c.bot.send_message(u.effective_chat.id,
-                               "Дякую! Якщо виникнуть питання — /start."))
+                    lambda u, c: c.bot.send_message(u.effective_chat.id, "Дякую! Якщо виникнуть питання — /start."))
             ],
         },
         fallbacks=[CommandHandler('cancel', cancel_command)],
@@ -769,13 +765,12 @@ async def run_bot():
     )
     application.add_handler(conv_handler, group=0)
 
-    # Глобальный fallback (если ConversationHandler не перехватил)
+    # Глобальный fallback
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, global_fallback_handler),
         group=1
     )
 
-    # Настройка webhook
     await setup_webhook(WEBHOOK_URL, application)
     await application.initialize()
     await application.start()
@@ -790,7 +785,7 @@ def start_flask():
     logger.info(f"Starting Flask on port {port}")
     app.run(host='0.0.0.0', port=port)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     bot_thread = threading.Thread(target=lambda: asyncio.run(run_bot()), daemon=True)
     bot_thread.start()
     logger.info("Bot thread started. Now starting Flask...")
