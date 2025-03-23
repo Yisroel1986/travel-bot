@@ -235,7 +235,7 @@ def cancel_no_response_job(context:CallbackContext):
 async def typing_simulation(update:Update, text:str):
     await update.effective_chat.send_action(ChatAction.TYPING)
     await asyncio.sleep(min(4, max(2, len(text)/70)))
-    await update.message.reply_text(text, reply_markup=ReplyKeyboardRemove())
+    await update.effective_chat.send_message(text, reply_markup=ReplyKeyboardRemove())
 
 # ============================
 # Intent detection
@@ -387,10 +387,15 @@ async def camp_phone_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
 
+    # Проверяем, не обработали ли мы уже это сообщение
+    if context.user_data.get("phone_processed"):
+        return STAGE_CAMP_PHONE
+
     phone_candidate = txt.replace(" ","").replace("-","")
     if phone_candidate.startswith("+") or phone_candidate.isdigit():
         # пользователь дал телефон
         context.user_data["phone"] = phone_candidate
+        context.user_data["phone_processed"] = True
         r = LAPLANDIA_IF_PHONE
         await typing_simulation(update, r)
         save_user_state(user_id, STAGE_CAMP_DETAILED, context.user_data)
@@ -398,6 +403,7 @@ async def camp_phone_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
         return STAGE_CAMP_DETAILED
     else:
         # не дал телефон
+        context.user_data["phone_processed"] = True
         r = LAPLANDIA_NO_PHONE
         await typing_simulation(update, r)
         save_user_state(user_id, STAGE_CAMP_NO_PHONE_QA, context.user_data)
@@ -434,6 +440,12 @@ async def camp_detailed_handler(update:Update, context:ContextTypes.DEFAULT_TYPE
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
     txt = update.message.text.strip()
+
+    # Проверяем, не обработали ли мы уже это сообщение
+    if context.user_data.get("detailed_processed"):
+        return STAGE_CAMP_DETAILED
+
+    context.user_data["detailed_processed"] = True
 
     # Проверяем, не является ли сообщение ответом на вопрос о деталях
     if "так" in txt.lower() or "добре" in txt.lower() or "розкажіть" in txt.lower():
@@ -565,6 +577,12 @@ async def zoo_choice_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def zoo_details_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     txt = update.message.text.lower()
+
+    # Проверяем, не обработали ли мы уже это сообщение
+    if context.user_data.get("zoo_details_processed"):
+        return STAGE_ZOO_DETAILS
+
+    context.user_data["zoo_details_processed"] = True
     choice = context.user_data.get("choice","details")
 
     if choice == "cost":
@@ -587,6 +605,12 @@ async def zoo_details_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
 async def zoo_questions_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     txt = update.message.text.lower()
+
+    # Проверяем, не обработали ли мы уже это сообщение
+    if context.user_data.get("zoo_questions_processed"):
+        return STAGE_ZOO_QUESTIONS
+
+    context.user_data["zoo_questions_processed"] = True
 
     if "брон" in txt:
         r = "Чудово, тоді переходимо до оформлення бронювання. Я надішлю реквізити для оплати!"
