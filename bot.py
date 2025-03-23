@@ -280,7 +280,13 @@ async def gpt_fallback_response(user_text:str, context:dict = None)->str:
             "каждого предложения. Всегда отвечай на украинском языке, даже если "
             "вопрос задан на другом языке. Отвечай одним четким сообщением, "
             "структурированным по пунктам. Если это ответ на нестандартный вопрос, "
-            "используй формат чата, но сохраняй структуру ответа."
+            "используй формат чата, но сохраняй структуру ответа.\n\n"
+            "Важные правила:\n"
+            "1. Всегда отвечай на украинском языке\n"
+            "2. Сохраняй контекст разговора\n"
+            "3. Следуй сценарию продаж\n"
+            "4. Не обрезай сообщения\n"
+            "5. Отвечай одним сообщением"
         )
         
         # Добавляем контекст разговора, если он есть
@@ -297,7 +303,7 @@ async def gpt_fallback_response(user_text:str, context:dict = None)->str:
             openai.ChatCompletion.create,
             model="gpt-4",
             messages=messages,
-            max_tokens=300,
+            max_tokens=1000,  # Увеличиваем лимит токенов
             temperature=0.7
         )
         return resp.choices[0].message.content.strip()
@@ -384,9 +390,9 @@ async def camp_phone_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     phone_candidate = txt.replace(" ","").replace("-","")
     if phone_candidate.startswith("+") or phone_candidate.isdigit():
         # пользователь дал телефон
+        context.user_data["phone"] = phone_candidate
         r = LAPLANDIA_IF_PHONE
         await typing_simulation(update, r)
-        # "Передаём" телефон менеджеру
         save_user_state(user_id, STAGE_CAMP_DETAILED, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
         return STAGE_CAMP_DETAILED
@@ -427,11 +433,27 @@ async def camp_no_phone_qa_handler(update:Update, context:ContextTypes.DEFAULT_T
 async def camp_detailed_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
     user_id = str(update.effective_user.id)
+    txt = update.message.text.strip()
 
-    r = LAPLANDIA_BRIEF
-    await typing_simulation(update, r)
-    save_user_state(user_id, STAGE_CAMP_END, context.user_data)
-    return STAGE_CAMP_END
+    # Проверяем, не является ли сообщение ответом на вопрос о деталях
+    if "так" in txt.lower() or "добре" in txt.lower() or "розкажіть" in txt.lower():
+        r = LAPLANDIA_BRIEF
+        await typing_simulation(update, r)
+        save_user_state(user_id, STAGE_CAMP_END, context.user_data)
+        return STAGE_CAMP_END
+    else:
+        # Если это не ответ на вопрос о деталях, используем GPT
+        prompt = (
+            f"Клієнт написав: {txt}\n"
+            "Контекст: Клієнт зацікавлений зимовим табором 'Лапландія в Карпатах'. "
+            "Вже надав номер телефону. Потрібно відповісти на українській мові, "
+            "зберігаючи дружній тон та структуру відповіді."
+        )
+        gpt_text = await gpt_fallback_response(prompt, context.user_data)
+        await typing_simulation(update, gpt_text)
+        save_user_state(user_id, STAGE_CAMP_DETAILED, context.user_data)
+        schedule_no_response_job(context, update.effective_chat.id)
+        return STAGE_CAMP_DETAILED
 
 # ============================
 # CAMP: END
@@ -572,11 +594,18 @@ async def zoo_questions_handler(update:Update, context:ContextTypes.DEFAULT_TYPE
         save_user_state(str(update.effective_user.id), STAGE_ZOO_CLOSE_DEAL, context.user_data)
         return STAGE_ZOO_CLOSE_DEAL
     else:
-        msg = "Як вам наша пропозиція загалом? 🌟"
-        await typing_simulation(update, msg)
-        save_user_state(str(update.effective_user.id), STAGE_ZOO_IMPRESSION, context.user_data)
+        # Используем GPT для нестандартных вопросов
+        prompt = (
+            f"Клієнт написав: {txt}\n"
+            "Контекст: Клієнт зацікавлений туром в зоопарк Ньїредьхаза. "
+            "Вже отримав інформацію про тур. Потрібно відповісти на українській мові, "
+            "зберігаючи дружній тон та структуру відповіді."
+        )
+        gpt_text = await gpt_fallback_response(prompt, context.user_data)
+        await typing_simulation(update, gpt_text)
+        save_user_state(str(update.effective_user.id), STAGE_ZOO_QUESTIONS, context.user_data)
         schedule_no_response_job(context, update.effective_chat.id)
-        return STAGE_ZOO_IMPRESSION
+        return STAGE_ZOO_QUESTIONS
 
 async def zoo_impression_handler(update:Update, context:ContextTypes.DEFAULT_TYPE):
     cancel_no_response_job(context)
