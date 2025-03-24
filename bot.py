@@ -287,10 +287,12 @@ async def gpt_fallback_response(message: str, context: CallbackContext) -> str:
     """Генерирует ответ с помощью GPT с учетом контекста и стадии разговора"""
     current_stage = context.user_data.get("current_stage", STAGE_SCENARIO_CHOICE)
     user_data = context.user_data
+    scenario = user_data.get("scenario", "")
     
     # Формируем контекст для GPT
     prompt = f"""Ты - продающий ассистент туристической компании. Твоя задача - продавать детские лагеря и экскурсии.
 Текущая стадия разговора: {current_stage}
+Сценарий: {scenario}
 История сообщений: {user_data.get('message_history', [])}
 Последнее сообщение пользователя: {message}
 
@@ -313,22 +315,29 @@ async def gpt_fallback_response(message: str, context: CallbackContext) -> str:
 - Стоимость: 1900 грн (включает трансфер, билеты, страховку)
 - После зоопарка: посещение торгового центра
 
-Правила ответов:
+Правила продажи:
 1. Всегда отвечай на украинском языке
 2. Используй эмодзи для эмоциональности
 3. Будь дружелюбным и позитивным
-4. Следуй продающему скрипту
-5. Не повторяй предыдущие сообщения
-6. Задавай конкретные вопросы
-7. Используй маркетинговые приемы (срочность, уникальность, социальное доказательство)
-8. Не придумывай информацию о других турах или услугах
-9. Фокусируйся только на продаже этих двух туров
+4. Следуй строгой структуре продажи:
+   - Приветствие/подтверждение
+   - Уточняющие вопросы
+   - Презентация выбранного тура
+   - Работа с возражениями
+   - Закрытие сделки
+5. Задавай конкретные вопросы и жди ответа
+6. Не переходи к следующему этапу, пока не получил ответ на текущий вопрос
+7. При отказе не прощайся сразу, а попробуй выяснить причину и предложить альтернативу
+8. При бронировании четко объясняй каждый шаг
+9. Фокусируйся только на выбранном туре, не смешивай информацию
 
 Структура ответа:
-1. Приветствие/подтверждение
-2. Основной контент
-3. Призыв к действию
-4. Следующий вопрос (если нужно)
+1. Приветствие/подтверждение предыдущего сообщения
+2. Уточняющий вопрос (если нужно)
+3. Информация о выбранном туре (если это этап презентации)
+4. Работа с возражениями (если есть)
+5. Призыв к действию
+6. Следующий вопрос
 
 Сгенерируй ответ, который поможет продвинуть продажу дальше."""
 
@@ -358,6 +367,13 @@ async def message_handler(update: Update, context: CallbackContext) -> int:
     # Получаем текущее состояние
     current_stage = context.user_data.get("current_stage", STAGE_SCENARIO_CHOICE)
     
+    # Определяем сценарий, если еще не определен
+    if current_stage == STAGE_SCENARIO_CHOICE:
+        if any(k in user_text.lower() for k in ["лагерь", "лапландія", "карпат", "зимовий"]):
+            context.user_data["scenario"] = "camp"
+        elif any(k in user_text.lower() for k in ["зоопарк", "ньиредьхаза", "ньиредьгаза"]):
+            context.user_data["scenario"] = "zoo"
+    
     # Сохраняем сообщение в историю
     message_history = context.user_data.get("message_history", [])
     message_history.append({"role": "user", "content": user_text})
@@ -377,39 +393,79 @@ async def message_handler(update: Update, context: CallbackContext) -> int:
     # Отправляем ответ с симуляцией набора
     await typing_simulation(update, response)
     
-    # Определяем следующее состояние
+    # Определяем следующее состояние на основе сценария
     next_stage = current_stage
-    if "лагерь" in user_text.lower() or "лапландія" in user_text.lower():
-        next_stage = STAGE_CAMP_PHONE
-    elif "зоопарк" in user_text.lower():
-        next_stage = STAGE_ZOO_GREET
-    elif current_stage == STAGE_CAMP_PHONE:
-        if any(char.isdigit() for char in user_text):
+    scenario = context.user_data.get("scenario", "")
+    
+    if scenario == "camp":
+        if current_stage == STAGE_SCENARIO_CHOICE:
+            next_stage = STAGE_CAMP_PHONE
+        elif current_stage == STAGE_CAMP_PHONE:
+            if any(char.isdigit() for char in user_text):
+                next_stage = STAGE_CAMP_CITY
+            else:
+                next_stage = STAGE_CAMP_NO_PHONE_QA
+        elif current_stage == STAGE_CAMP_NO_PHONE_QA:
+            if is_positive_response(user_text):
+                next_stage = STAGE_CAMP_CITY
+            else:
+                next_stage = STAGE_CAMP_END
+        elif current_stage == STAGE_CAMP_CITY:
+            next_stage = STAGE_CAMP_CHILDREN
+        elif current_stage == STAGE_CAMP_CHILDREN:
             next_stage = STAGE_CAMP_DETAILED
-    elif current_stage == STAGE_CAMP_DETAILED:
-        next_stage = STAGE_CAMP_END
-    elif current_stage == STAGE_ZOO_GREET:
-        next_stage = STAGE_ZOO_DEPARTURE
-    elif current_stage == STAGE_ZOO_DEPARTURE:
-        next_stage = STAGE_ZOO_TRAVEL_PARTY
-    elif current_stage == STAGE_ZOO_TRAVEL_PARTY:
-        next_stage = STAGE_ZOO_CHILD_AGE
-    elif current_stage == STAGE_ZOO_CHILD_AGE:
-        next_stage = STAGE_ZOO_CHOICE
-    elif current_stage == STAGE_ZOO_CHOICE:
-        next_stage = STAGE_ZOO_DETAILS
-    elif current_stage == STAGE_ZOO_DETAILS:
-        next_stage = STAGE_ZOO_QUESTIONS
-    elif current_stage == STAGE_ZOO_QUESTIONS:
-        next_stage = STAGE_ZOO_IMPRESSION
-    elif current_stage == STAGE_ZOO_IMPRESSION:
-        next_stage = STAGE_ZOO_CLOSE_DEAL
-    elif current_stage == STAGE_ZOO_CLOSE_DEAL:
-        next_stage = STAGE_ZOO_PAYMENT
-    elif current_stage == STAGE_ZOO_PAYMENT:
-        next_stage = STAGE_ZOO_PAYMENT_CONFIRM
-    elif current_stage == STAGE_ZOO_PAYMENT_CONFIRM:
-        next_stage = STAGE_ZOO_END
+        elif current_stage == STAGE_CAMP_DETAILED:
+            if "брон" in user_text.lower():
+                next_stage = STAGE_CAMP_PHONE
+            else:
+                next_stage = STAGE_CAMP_END
+    
+    elif scenario == "zoo":
+        if current_stage == STAGE_SCENARIO_CHOICE:
+            next_stage = STAGE_ZOO_GREET
+        elif current_stage == STAGE_ZOO_GREET:
+            if is_positive_response(user_text):
+                next_stage = STAGE_ZOO_DEPARTURE
+            else:
+                next_stage = STAGE_ZOO_DETAILS
+        elif current_stage == STAGE_ZOO_DEPARTURE:
+            next_stage = STAGE_ZOO_TRAVEL_PARTY
+        elif current_stage == STAGE_ZOO_TRAVEL_PARTY:
+            if "дит" in user_text.lower():
+                next_stage = STAGE_ZOO_CHILD_AGE
+            else:
+                next_stage = STAGE_ZOO_CHOICE
+        elif current_stage == STAGE_ZOO_CHILD_AGE:
+            next_stage = STAGE_ZOO_CHOICE
+        elif current_stage == STAGE_ZOO_CHOICE:
+            if "брон" in user_text.lower():
+                next_stage = STAGE_ZOO_CLOSE_DEAL
+            else:
+                next_stage = STAGE_ZOO_DETAILS
+        elif current_stage == STAGE_ZOO_DETAILS:
+            next_stage = STAGE_ZOO_QUESTIONS
+        elif current_stage == STAGE_ZOO_QUESTIONS:
+            if "брон" in user_text.lower():
+                next_stage = STAGE_ZOO_CLOSE_DEAL
+            else:
+                next_stage = STAGE_ZOO_IMPRESSION
+        elif current_stage == STAGE_ZOO_IMPRESSION:
+            if is_positive_response(user_text):
+                next_stage = STAGE_ZOO_CLOSE_DEAL
+            else:
+                next_stage = STAGE_ZOO_END
+        elif current_stage == STAGE_ZOO_CLOSE_DEAL:
+            if any(k in user_text.lower() for k in ["приват", "моно", "оплат", "готов", "давайте", "скинь", "реквізит"]):
+                next_stage = STAGE_ZOO_PAYMENT
+            else:
+                next_stage = STAGE_ZOO_END
+        elif current_stage == STAGE_ZOO_PAYMENT:
+            if any(k in user_text.lower() for k in ["оплат", "відправ", "готово", "скинув", "чек"]):
+                next_stage = STAGE_ZOO_PAYMENT_CONFIRM
+            else:
+                next_stage = STAGE_ZOO_PAYMENT
+        elif current_stage == STAGE_ZOO_PAYMENT_CONFIRM:
+            next_stage = STAGE_ZOO_END
     
     # Сохраняем состояние пользователя
     save_user_state(user_id, next_stage, context.user_data)
