@@ -331,6 +331,21 @@ async def gpt_fallback_response(message: str, context: CallbackContext) -> str:
 8. При бронировании четко объясняй каждый шаг
 9. Фокусируйся только на выбранном туре, не смешивай информацию
 
+Правила работы с возражениями:
+1. При отказе всегда выясняй причину:
+   - "Можете рассказать, что именно вас смутило?"
+   - "Что именно вас беспокоит?"
+   - "Почему вы передумали?"
+2. Предлагай альтернативы:
+   - Если клиент не хочет в зоопарк, предложи зимний лагерь
+   - Если не хочет в лагерь, предложи зоопарк
+3. Работай с конкретными возражениями:
+   - Цена: "Давайте посчитаем, что входит в стоимость"
+   - Дата: "У нас есть другие даты"
+   - Место: "Мы можем организовать трансфер из вашего города"
+4. Не сдавайся после первого отказа
+5. Всегда оставляй возможность вернуться к разговору
+
 Структура ответа:
 1. Приветствие/подтверждение предыдущего сообщения
 2. Уточняющий вопрос (если нужно)
@@ -374,10 +389,17 @@ async def message_handler(update: Update, context: CallbackContext) -> int:
         elif any(k in user_text.lower() for k in ["зоопарк", "ньиредьхаза", "ньиредьгаза"]):
             context.user_data["scenario"] = "zoo"
     
-    # Сохраняем сообщение в историю
-    message_history = context.user_data.get("message_history", [])
-    message_history.append({"role": "user", "content": user_text})
-    context.user_data["message_history"] = message_history
+    # Проверяем на отказ или возражение
+    if any(k in user_text.lower() for k in ["передумав", "не хочу", "не потрібно", "ні", "нет", "не нужно"]):
+        # Сохраняем информацию об отказе
+        context.user_data["last_objection"] = user_text
+        # Не меняем стадию, чтобы GPT мог поработать с возражением
+        next_stage = current_stage
+    else:
+        # Сохраняем сообщение в историю
+        message_history = context.user_data.get("message_history", [])
+        message_history.append({"role": "user", "content": user_text})
+        context.user_data["message_history"] = message_history
     
     # Отменяем предыдущий таймер
     if "no_response_job" in context.user_data:
@@ -387,6 +409,7 @@ async def message_handler(update: Update, context: CallbackContext) -> int:
     response = await gpt_fallback_response(user_text, context)
     
     # Сохраняем ответ в историю
+    message_history = context.user_data.get("message_history", [])
     message_history.append({"role": "assistant", "content": response})
     context.user_data["message_history"] = message_history
     
